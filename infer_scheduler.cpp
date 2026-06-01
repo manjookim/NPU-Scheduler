@@ -14,6 +14,7 @@
 #define BATCH_SIZE     1
 #define THRESHOLD      0
 #define TIMEOUT_MS     0
+#define PRIORITY       0   // 0=보통, 1=높음, 2=매우높음
 // ==========================================================
 
 #define DET_HEF  "/home/rpi1/hailo-rpi5-examples/resources/yolov8s_h8l.hef"
@@ -137,23 +138,25 @@ hailo_status run_inference(hailo_configured_network_group network_group,
 
 void save_csv(double det_lat, double seg_lat, double pose_lat,
               double cpu, double mem, long ctx) {
-    // 파일이 없으면 헤더 추가
     std::ifstream check(CSV_PATH);
     bool write_header = !check.good();
     check.close();
 
     std::ofstream f(CSV_PATH, std::ios::app);
     if (write_header)
-        f << "batch,threshold,det_latency_ms,seg_latency_ms,pose_latency_ms,cpu_percent,mem_percent,context_switches\n";
+        f << "batch,threshold,timeout_ms,priority,det_latency_ms,seg_latency_ms,pose_latency_ms,cpu_percent,mem_percent,context_switches,npu_percent\n";
 
     f << BATCH_SIZE << ","
       << THRESHOLD << ","
+      << TIMEOUT_MS << ","
+      << PRIORITY << ","
       << det_lat << ","
       << seg_lat << ","
       << pose_lat << ","
       << cpu << ","
       << mem << ","
-      << ctx << "\n";
+      << ctx << ","
+      << "\n";
     f.close();
     printf("결과가 %s 에 저장됐습니다!\n", CSV_PATH);
 }
@@ -195,8 +198,10 @@ int main() {
 
         hailo_set_scheduler_threshold(network_groups[i], THRESHOLD, NULL);
         hailo_set_scheduler_timeout(network_groups[i], TIMEOUT_MS, NULL);
+        hailo_set_scheduler_priority(network_groups[i], PRIORITY, NULL);
 
-        printf("%s 모델 설정 완료! (batch=%d, threshold=%d)\n", model_names[i], BATCH_SIZE, THRESHOLD);
+        printf("%s 모델 설정 완료! (batch=%d, threshold=%d, timeout=%dms, priority=%d)\n",
+            model_names[i], BATCH_SIZE, THRESHOLD, TIMEOUT_MS, PRIORITY);
     }
 
     std::vector<std::string> images = get_image_files(IMG_DIR);
@@ -243,7 +248,8 @@ int main() {
     long ctx_total = ctx_end - ctx_start;
 
     printf("\n========== 실험 결과 ==========\n");
-    printf("파라미터: batch=%d, threshold=%d\n\n", BATCH_SIZE, THRESHOLD);
+    printf("파라미터: batch=%d, threshold=%d, timeout=%dms, priority=%d\n\n",
+        BATCH_SIZE, THRESHOLD, TIMEOUT_MS, PRIORITY);
     printf("총 추론 이미지: %d장\n\n", count);
     printf("Detection 평균 Latency: %.2f ms\n", det_avg);
     printf("Segmentation 평균 Latency: %.2f ms\n", seg_avg);
