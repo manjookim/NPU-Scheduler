@@ -14,7 +14,7 @@
 #define BATCH_SIZE     1
 #define THRESHOLD      0
 #define TIMEOUT_MS     0
-#define PRIORITY       0   // 0=보통, 1=높음, 2=매우높음
+#define PRIORITY       0
 // ==========================================================
 
 #define DET_HEF  "/home/rpi1/hailo-rpi5-examples/resources/yolov8s_h8l.hef"
@@ -89,12 +89,13 @@ std::vector<std::string> get_image_files(const char* dir_path) {
     return files;
 }
 
-hailo_status run_inference(hailo_configured_network_group network_group,
-                           cv::Mat& input_img,
-                           size_t output_count,
-                           double& latency_ms) {
+hailo_status run_inference_batch(hailo_configured_network_group network_group,
+                                  std::vector<cv::Mat>& batch_imgs,
+                                  size_t output_count,
+                                  double& latency_ms) {
     hailo_status status;
     size_t input_count = 1;
+    size_t actual_batch = batch_imgs.size();
 
     hailo_input_vstream_params_by_name_t input_params[1];
     hailo_output_vstream_params_by_name_t output_params[16];
@@ -116,19 +117,27 @@ hailo_status run_inference(hailo_configured_network_group network_group,
 
     auto start = std::chrono::high_resolution_clock::now();
 
-    status = hailo_vstream_write_raw_buffer(input_vstreams[0], input_img.data, input_img.total() * input_img.elemSize());
-    if (status != HAILO_SUCCESS) return status;
+    // BATCH_SIZE만큼 이미지를 순서대로 전송
+    for (size_t b = 0; b < actual_batch; b++) {
+        status = hailo_vstream_write_raw_buffer(input_vstreams[0],
+            batch_imgs[b].data,
+            batch_imgs[b].total() * batch_imgs[b].elemSize());
+        if (status != HAILO_SUCCESS) return status;
+    }
 
-    for (size_t i = 0; i < output_count; i++) {
-        size_t output_size = 0;
-        hailo_get_output_vstream_frame_size(output_vstreams[i], &output_size);
-        uint8_t* buf = (uint8_t*)malloc(output_size);
-        hailo_vstream_read_raw_buffer(output_vstreams[i], buf, output_size);
-        free(buf);
+    // BATCH_SIZE만큼 출력 읽기
+    for (size_t b = 0; b < actual_batch; b++) {
+        for (size_t i = 0; i < output_count; i++) {
+            size_t output_size = 0;
+            hailo_get_output_vstream_frame_size(output_vstreams[i], &output_size);
+            uint8_t* buf = (uint8_t*)malloc(output_size);
+            hailo_vstream_read_raw_buffer(output_vstreams[i], buf, output_size);
+            free(buf);
+        }
     }
 
     auto end = std::chrono::high_resolution_clock::now();
-    latency_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    latency_ms = std::chrono::duration<double, std::milli>(end - start).count() / actual_batch;
 
     hailo_release_input_vstreams(input_vstreams, input_count);
     hailo_release_output_vstreams(output_vstreams, output_count);
@@ -155,8 +164,7 @@ void save_csv(double det_lat, double seg_lat, double pose_lat,
       << pose_lat << ","
       << cpu << ","
       << mem << ","
-      << ctx << ","
-      << "\n";
+      << ctx << ",\n";
     f.close();
     printf("결과가 %s 에 저장됐습니다!\n", CSV_PATH);
 }
@@ -213,17 +221,26 @@ int main() {
     long ctx_start = read_context_switches();
     CpuStats cpu_start = read_cpu_stats();
     int count = 0;
+    int batch_count = 0;
 
-    for (const auto& img_path : images) {
-        cv::Mat img = cv::imread(img_path);
-        if (img.empty()) continue;
-        cv::Mat resized;
-        cv::resize(img, resized, cv::Size(640, 640));
-        cv::cvtColor(resized, resized, cv::COLOR_BGR2RGB);
+    // BATCH_SIZE만큼 묶어서 추론
+    for (size_t idx = 0; idx + BATCH_SIZE <= images.size(); idx += BATCH_SIZE) {
+        // 배치 이미지 준비
+        std::vector<cv::Mat> batch_imgs;
+        for (int b = 0; b < BATCH_SIZE; b++) {
+            cv::Mat img = cv::imread(images[idx + b]);
+            if (img.empty()) continue;
+            cv::Mat resized;
+            cv::resize(img, resized, cv::Size(640, 640));
+            cv::cvtColor(resized, resized, cv::COLOR_BGR2RGB);
+            batch_imgs.push_back(resized);
+        }
+        if ((int)batch_imgs.size() != BATCH_SIZE) continue;
 
+        // 3개 모델 추론
         for (int i = 0; i < 3; i++) {
             double latency = 0;
-            status = run_inference(network_groups[i], resized, output_counts[i], latency);
+            status = run_inference_batch(network_groups[i], batch_imgs, output_counts[i], latency);
             if (status != HAILO_SUCCESS) { printf("추론 실패: %d\n", status); return 1; }
             total_latency[i] += latency;
         }
@@ -231,9 +248,10 @@ int main() {
         CpuStats cpu_now = read_cpu_stats();
         cpu_usage_sum += calc_cpu_usage(cpu_start, cpu_now);
         mem_usage_sum += read_mem_usage();
-        count++;
+        count += BATCH_SIZE;
+        batch_count++;
 
-        if (count % 100 == 0)
+        if (batch_count % (100 / BATCH_SIZE + 1) == 0)
             printf("진행 중: %d / %zu장\n", count, images.size());
     }
 
@@ -241,16 +259,16 @@ int main() {
     CpuStats cpu_end = read_cpu_stats();
     double final_cpu = calc_cpu_usage(cpu_start, cpu_end);
 
-    double det_avg = total_latency[0] / count;
-    double seg_avg = total_latency[1] / count;
-    double pose_avg = total_latency[2] / count;
-    double mem_avg = mem_usage_sum / count;
+    double det_avg = total_latency[0] / batch_count;
+    double seg_avg = total_latency[1] / batch_count;
+    double pose_avg = total_latency[2] / batch_count;
+    double mem_avg = mem_usage_sum / batch_count;
     long ctx_total = ctx_end - ctx_start;
 
     printf("\n========== 실험 결과 ==========\n");
     printf("파라미터: batch=%d, threshold=%d, timeout=%dms, priority=%d\n\n",
         BATCH_SIZE, THRESHOLD, TIMEOUT_MS, PRIORITY);
-    printf("총 추론 이미지: %d장\n\n", count);
+    printf("총 추론 이미지: %d장 (%d 배치)\n\n", count, batch_count);
     printf("Detection 평균 Latency: %.2f ms\n", det_avg);
     printf("Segmentation 평균 Latency: %.2f ms\n", seg_avg);
     printf("Pose 평균 Latency: %.2f ms\n", pose_avg);
