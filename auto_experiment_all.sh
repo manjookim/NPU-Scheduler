@@ -1,16 +1,18 @@
 #!/bin/bash
-# ========== 전체 자동 실험 스크립트 (63개) ==========
+# ========== 전체 자동 실험 스크립트 (63개 조건 × 3회 반복 = 189회) ==========
 cd ~/hailo_cpp_test
+
+REPEAT=3  # 반복 횟수
 
 compile_and_run() {
     local USE_D=$1 USE_S=$2 USE_P=$3
     local PRI_D=$4 PRI_S=$5 PRI_P=$6
+    local RUN_ID=$7
 
     echo "======================================"
-    echo "실험: Det=$USE_D($PRI_D), Seg=$USE_S($PRI_S), Pose=$USE_P($PRI_P)"
+    echo "실험: Det=$USE_D($PRI_D), Seg=$USE_S($PRI_S), Pose=$USE_P($PRI_P) | Run=$RUN_ID"
     echo "======================================"
 
-    # traces 디렉토리 생성
     mkdir -p traces
 
     # 파라미터 수정
@@ -24,11 +26,10 @@ compile_and_run() {
     sed -i "s/#define PRIORITY_SEG.*/#define PRIORITY_SEG    $PRI_S/" infer_scheduler.cpp
     sed -i "s/#define PRIORITY_POSE.*/#define PRIORITY_POSE   $PRI_P/" infer_scheduler.cpp
 
-    # 파라미터 확인
     echo "파라미터 확인:"
     grep "#define BATCH_SIZE\|#define THRESHOLD\|#define TIMEOUT\|#define USE\|#define PRIORITY" infer_scheduler.cpp
 
-    # 컴파일
+    # 컴파일 (조건당 1회만 컴파일, run 반복 시 재컴파일 불필요하나 안전하게 유지)
     g++ infer_scheduler.cpp -o infer_scheduler -lhailort $(pkg-config --cflags --libs opencv4) -lpthread
     if [ $? -ne 0 ]; then echo "컴파일 실패!"; return; fi
 
@@ -36,7 +37,7 @@ compile_and_run() {
     > npu_log.txt
     rm -f /tmp/hmon_files/*
 
-    # 이전 실험의 unnamed HRTT 파일 제거 (잘못된 파일 선택 방지)
+    # 이전 unnamed HRTT 파일 제거
     rm -f traces/hailort_*.hrtt
 
     # NPU 모니터링 백그라운드
@@ -51,15 +52,15 @@ compile_and_run() {
     export HAILO_TRACE_PATH=/home/rpi1/hailo_cpp_test/traces
     export HAILO_MONITOR=1
 
-    # 추론 실행
-    ./infer_scheduler
+    # 추론 실행 (run_id를 인자로 전달)
+    ./infer_scheduler $RUN_ID
 
     # NPU 종료
     kill $NPU_PID
     sleep 1
     rm -f /tmp/hmon_files/*
 
-    # HRTT 파일이 생성될 때까지 대기 (최대 35초)
+    # HRTT 파일 대기 (최대 35초)
     LATEST_HRTT=""
     for i in $(seq 1 35); do
         LATEST_HRTT=$(ls -t traces/hailort_*.hrtt 2>/dev/null | head -1)
@@ -69,13 +70,12 @@ compile_and_run() {
 
     if [ -n "$LATEST_HRTT" ]; then
         TIMESTAMP=$(basename "$LATEST_HRTT" .hrtt | sed 's/hailort_//')
-        NEW_NAME="traces/${USE_D}D-${USE_S}S-${USE_P}P_${PRI_D}PD-${PRI_S}PS-${PRI_P}PP_${TIMESTAMP}.hrtt"
+        NEW_NAME="traces/${USE_D}D-${USE_S}S-${USE_P}P_${PRI_D}PD-${PRI_S}PS-${PRI_P}PP_run${RUN_ID}_${TIMESTAMP}.hrtt"
         mv "$LATEST_HRTT" "$NEW_NAME"
         echo "HRTT: $NEW_NAME"
 
-        # runtime_report.html을 실험별로 즉시 복사 저장 (덮어쓰이기 전에)
         if [ -f "traces/runtime_report.html" ]; then
-            HTML_NAME="traces/${USE_D}D-${USE_S}S-${USE_P}P_${PRI_D}PD-${PRI_S}PS-${PRI_P}PP_${TIMESTAMP}.html"
+            HTML_NAME="traces/${USE_D}D-${USE_S}S-${USE_P}P_${PRI_D}PD-${PRI_S}PS-${PRI_P}PP_run${RUN_ID}_${TIMESTAMP}.html"
             cp "traces/runtime_report.html" "$HTML_NAME"
             echo "HTML: $HTML_NAME"
         fi
@@ -86,50 +86,64 @@ compile_and_run() {
     # NPU 파싱
     python3 parse_npu_log.py
 
-    echo "완료!"
+    echo "완료! (Run $RUN_ID)"
     echo ""
 }
 
 priorities=(0 15 31)
 
-echo "===== Single 실험 (9개) ====="
+echo "===== Single 실험 (9개 조건 × ${REPEAT}회) ====="
 
 for p in "${priorities[@]}"; do
-    compile_and_run 1 0 0 $p 0 0
+    for run in $(seq 1 $REPEAT); do
+        compile_and_run 1 0 0 $p 0 0 $run
+    done
 done
 for p in "${priorities[@]}"; do
-    compile_and_run 0 1 0 0 $p 0
+    for run in $(seq 1 $REPEAT); do
+        compile_and_run 0 1 0 0 $p 0 $run
+    done
 done
 for p in "${priorities[@]}"; do
-    compile_and_run 0 0 1 0 0 $p
+    for run in $(seq 1 $REPEAT); do
+        compile_and_run 0 0 1 0 0 $p $run
+    done
 done
 
-echo "===== 2개 Multi 실험 (27개) ====="
+echo "===== 2개 Multi 실험 (27개 조건 × ${REPEAT}회) ====="
 
 for pd in "${priorities[@]}"; do
     for ps in "${priorities[@]}"; do
-        compile_and_run 1 1 0 $pd $ps 0
+        for run in $(seq 1 $REPEAT); do
+            compile_and_run 1 1 0 $pd $ps 0 $run
+        done
     done
 done
 for pd in "${priorities[@]}"; do
     for pp in "${priorities[@]}"; do
-        compile_and_run 1 0 1 $pd 0 $pp
+        for run in $(seq 1 $REPEAT); do
+            compile_and_run 1 0 1 $pd 0 $pp $run
+        done
     done
 done
 for ps in "${priorities[@]}"; do
     for pp in "${priorities[@]}"; do
-        compile_and_run 0 1 1 0 $ps $pp
-    done
-done
-
-echo "===== 3개 Multi 실험 (27개) ====="
-
-for pd in "${priorities[@]}"; do
-    for ps in "${priorities[@]}"; do
-        for pp in "${priorities[@]}"; do
-            compile_and_run 1 1 1 $pd $ps $pp
+        for run in $(seq 1 $REPEAT); do
+            compile_and_run 0 1 1 0 $ps $pp $run
         done
     done
 done
 
-echo "===== 모든 실험 완료! (63개) ====="
+echo "===== 3개 Multi 실험 (27개 조건 × ${REPEAT}회) ====="
+
+for pd in "${priorities[@]}"; do
+    for ps in "${priorities[@]}"; do
+        for pp in "${priorities[@]}"; do
+            for run in $(seq 1 $REPEAT); do
+                compile_and_run 1 1 1 $pd $ps $pp $run
+            done
+        done
+    done
+done
+
+echo "===== 모든 실험 완료! (63개 조건 × ${REPEAT}회 = $((63 * REPEAT))회) ====="

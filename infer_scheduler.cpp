@@ -11,6 +11,8 @@
 #include <sstream>
 #include <thread>
 #include <mutex>
+#include <algorithm>
+#include <unistd.h>
 
 // ========== 파라미터 설정 ==========
 #define BATCH_SIZE      1
@@ -36,6 +38,8 @@
 #define POSE_OUTPUT_COUNT 9
 
 std::mutex print_mutex;
+
+// ========== 시스템 모니터링 ==========
 
 struct CpuStats {
     long user, nice, system, idle, iowait, irq, softirq;
@@ -72,17 +76,52 @@ double read_mem_usage() {
     return 100.0 * (1.0 - (double)available / (double)total);
 }
 
-long read_context_switches() {
-    std::ifstream f("/proc/stat");
+// 프로세스별 context switch: /proc/[PID]/status에서 읽기
+struct CtxSwitches {
+    long voluntary;
+    long nonvoluntary;
+};
+
+CtxSwitches read_process_ctx_switches(pid_t pid) {
+    CtxSwitches cs = {0, 0};
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    std::ifstream f(path);
     std::string line;
     while (std::getline(f, line)) {
-        if (line.find("ctxt") != std::string::npos) {
-            long ctxt = 0;
-            sscanf(line.c_str(), "ctxt %ld", &ctxt);
-            return ctxt;
-        }
+        if (line.find("voluntary_ctxt_switches:") != std::string::npos)
+            sscanf(line.c_str(), "voluntary_ctxt_switches: %ld", &cs.voluntary);
+        else if (line.find("nonvoluntary_ctxt_switches:") != std::string::npos)
+            sscanf(line.c_str(), "nonvoluntary_ctxt_switches: %ld", &cs.nonvoluntary);
     }
-    return 0;
+    return cs;
+}
+
+// ========== 이미지 유틸 ==========
+
+// Letterbox: 비율 유지 resize + gray(114) 패딩 → 640x640
+// YOLOv8 학습 전처리와 동일 (RoundRobin.py letterbox 참고)
+cv::Mat letterbox(const cv::Mat& img, int target_size = 640) {
+    int orig_h = img.rows;
+    int orig_w = img.cols;
+
+    float scale = std::min((float)target_size / orig_h, (float)target_size / orig_w);
+    int new_h = (int)(orig_h * scale);
+    int new_w = (int)(orig_w * scale);
+
+    cv::Mat resized;
+    cv::resize(img, resized, cv::Size(new_w, new_h));
+
+    // 패딩 계산 (중앙 배치)
+    int pad_top    = (target_size - new_h) / 2;
+    int pad_bottom = target_size - new_h - pad_top;
+    int pad_left   = (target_size - new_w) / 2;
+    int pad_right  = target_size - new_w - pad_left;
+
+    cv::Mat out;
+    cv::copyMakeBorder(resized, out, pad_top, pad_bottom, pad_left, pad_right,
+                       cv::BORDER_CONSTANT, cv::Scalar(114, 114, 114));
+    return out;
 }
 
 std::vector<std::string> get_image_files(const char* dir_path) {
@@ -96,8 +135,11 @@ std::vector<std::string> get_image_files(const char* dir_path) {
             files.push_back(std::string(dir_path) + name);
     }
     closedir(dir);
+    std::sort(files.begin(), files.end());  // 실험 재현성을 위해 정렬
     return files;
 }
+
+// ========== 추론 스레드 ==========
 
 void inference_thread(hailo_configured_network_group network_group,
                       std::vector<std::string>& images,
@@ -123,17 +165,19 @@ void inference_thread(hailo_configured_network_group network_group,
     int batch_count = 0;
 
     for (size_t idx = 0; idx + BATCH_SIZE <= images.size(); idx += BATCH_SIZE) {
+        // ── 전처리 (latency 측정 제외) ──
         std::vector<cv::Mat> batch_imgs;
         for (int b = 0; b < BATCH_SIZE; b++) {
             cv::Mat img = cv::imread(images[idx + b]);
             if (img.empty()) continue;
-            cv::Mat resized;
-            cv::resize(img, resized, cv::Size(640, 640));
-            cv::cvtColor(resized, resized, cv::COLOR_BGR2RGB);
-            batch_imgs.push_back(resized);
+            // Letterbox: 비율 유지 resize + 패딩
+            cv::Mat lb = letterbox(img, 640);
+            cv::cvtColor(lb, lb, cv::COLOR_BGR2RGB);
+            batch_imgs.push_back(lb);
         }
         if ((int)batch_imgs.size() != BATCH_SIZE) continue;
 
+        // ── 추론 Latency 측정 시작 (H2D + NPU exec + D2H) ──
         auto start = std::chrono::high_resolution_clock::now();
 
         for (size_t b = 0; b < batch_imgs.size(); b++)
@@ -150,6 +194,8 @@ void inference_thread(hailo_configured_network_group network_group,
             }
 
         auto end = std::chrono::high_resolution_clock::now();
+        // ── 측정 종료 ──
+
         latency_sum += std::chrono::duration<double, std::milli>(end - start).count() / BATCH_SIZE;
         count += BATCH_SIZE;
         batch_count++;
@@ -170,18 +216,23 @@ void inference_thread(hailo_configured_network_group network_group,
     printf("[%s] 완료: 평균 Latency=%.2f ms, 총 %d장\n", model_name, total_latency, total_count);
 }
 
-void save_csv(double det_lat, double seg_lat, double pose_lat,
-              double cpu, double mem, long ctx) {
+// ========== CSV 저장 ==========
+
+void save_csv(int run_id,
+              double det_lat, double seg_lat, double pose_lat,
+              double cpu, double mem,
+              long vol_ctx, long nonvol_ctx) {
     std::ifstream check(CSV_PATH);
     bool write_header = !check.good();
     check.close();
 
     std::ofstream f(CSV_PATH, std::ios::app);
     if (write_header)
-        f << "use_det,use_seg,use_pose,batch,threshold,timeout_ms,"
+        f << "run_id,use_det,use_seg,use_pose,batch,threshold,timeout_ms,"
           << "priority_det,priority_seg,priority_pose,"
           << "det_latency_ms,seg_latency_ms,pose_latency_ms,"
-          << "cpu_percent,mem_percent,context_switches,npu_percent\n";
+          << "cpu_percent,mem_percent,"
+          << "voluntary_ctx_switches,nonvoluntary_ctx_switches,npu_percent\n";
 
     auto val = [](int use, int priority) -> std::string {
         return use ? std::to_string(priority) : "None";
@@ -190,7 +241,8 @@ void save_csv(double det_lat, double seg_lat, double pose_lat,
         return l >= 0 ? std::to_string(l) : "None";
     };
 
-    f << USE_DET << "," << USE_SEG << "," << USE_POSE << ","
+    f << run_id << ","
+      << USE_DET << "," << USE_SEG << "," << USE_POSE << ","
       << BATCH_SIZE << "," << THRESHOLD << "," << TIMEOUT_MS << ","
       << val(USE_DET, PRIORITY_DET) << ","
       << val(USE_SEG, PRIORITY_SEG) << ","
@@ -198,12 +250,21 @@ void save_csv(double det_lat, double seg_lat, double pose_lat,
       << lat(det_lat) << ","
       << lat(seg_lat) << ","
       << lat(pose_lat) << ","
-      << cpu << "," << mem << "," << ctx << ",\n";
+      << cpu << "," << mem << ","
+      << vol_ctx << "," << nonvol_ctx << ",\n";  // npu_percent는 parse_npu_log.py가 채움
     f.close();
     printf("결과 저장: %s\n", CSV_PATH);
 }
 
-int main() {
+// ========== main ==========
+
+int main(int argc, char* argv[]) {
+    // run_id: 스크립트에서 첫 번째 인자로 전달 (없으면 1)
+    int run_id = (argc > 1) ? atoi(argv[1]) : 1;
+
+    pid_t my_pid = getpid();
+    printf("PID: %d, Run ID: %d\n", my_pid, run_id);
+
     hailo_status status;
     hailo_vdevice vdevice;
     hailo_vdevice_params_t vdevice_params;
@@ -258,7 +319,8 @@ int main() {
     std::vector<std::string> images = get_image_files(IMG_DIR);
     printf("\n총 이미지 수: %zu장, 활성 모델: %d개\n\n", images.size(), active_count);
 
-    long ctx_start = read_context_switches();
+    // 측정 시작
+    CtxSwitches ctx_start = read_process_ctx_switches(my_pid);
     CpuStats cpu_start = read_cpu_stats();
 
     double latencies[3] = {-1, -1, -1};
@@ -274,22 +336,28 @@ int main() {
     }
     for (auto& t : threads) t.join();
 
-    long ctx_end = read_context_switches();
+    // 측정 종료
+    CtxSwitches ctx_end = read_process_ctx_switches(my_pid);
     CpuStats cpu_end = read_cpu_stats();
+
     double final_cpu = calc_cpu_usage(cpu_start, cpu_end);
     double final_mem = read_mem_usage();
-    long ctx_total = ctx_end - ctx_start;
+    long vol_ctx   = ctx_end.voluntary    - ctx_start.voluntary;
+    long nonvol_ctx = ctx_end.nonvoluntary - ctx_start.nonvoluntary;
 
     printf("\n========== 실험 결과 ==========\n");
+    printf("Run ID: %d\n", run_id);
     printf("모델: Det=%d, Seg=%d, Pose=%d\n", USE_DET, USE_SEG, USE_POSE);
     printf("Priority: Det=%d, Seg=%d, Pose=%d\n\n", PRIORITY_DET, PRIORITY_SEG, PRIORITY_POSE);
     if (USE_DET)  printf("Detection 평균 Latency: %.2f ms\n", latencies[0]);
     if (USE_SEG)  printf("Segmentation 평균 Latency: %.2f ms\n", latencies[1]);
     if (USE_POSE) printf("Pose 평균 Latency: %.2f ms\n", latencies[2]);
-    printf("CPU: %.2f%%, MEM: %.2f%%, Context Switch: %ld\n", final_cpu, final_mem, ctx_total);
+    printf("CPU: %.2f%%, MEM: %.2f%%\n", final_cpu, final_mem);
+    printf("Context Switches - Voluntary: %ld, NonVoluntary: %ld\n", vol_ctx, nonvol_ctx);
     printf("================================\n");
 
-    save_csv(latencies[0], latencies[1], latencies[2], final_cpu, final_mem, ctx_total);
+    save_csv(run_id, latencies[0], latencies[1], latencies[2],
+             final_cpu, final_mem, vol_ctx, nonvol_ctx);
 
     for (int i = 0; i < 3; i++)
         if (models[i].active) hailo_release_hef(hefs[i]);
