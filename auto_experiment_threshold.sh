@@ -1,5 +1,8 @@
 #!/bin/bash
-# ========== 전체 자동 실험 스크립트 (63개 조건 × 3회 반복 = 189회) ==========
+# ========== threshold 실험 (priority=threshold, 2개+3개 모델) ==========
+# 조건: 각 모델 threshold = 해당 모델 priority (cpp의 THRESHOLD_EQ_PRIORITY=1)
+#       priority 0/15/31, batch=1, timeout=0 default 유지
+#       2개 모델 27개 + 3개 모델 27개 = 54개 조건 × 3회 = 162회
 cd ~/hailo_cpp_test
 
 REPEAT=3  # 반복 횟수
@@ -7,10 +10,10 @@ REPEAT=3  # 반복 횟수
 # ── 실험 폴더 생성 (날짜 + 회차 자동 증가) ──
 EXP_DATE=$(date +%Y-%m-%d)
 EXP_NUM=1
-EXP_DIR="experiments/${EXP_DATE}_priority_exp${EXP_NUM}"
+EXP_DIR="experiments/${EXP_DATE}_threshold_exp${EXP_NUM}"
 while [ -d "$EXP_DIR" ]; do
     EXP_NUM=$((EXP_NUM + 1))
-    EXP_DIR="experiments/${EXP_DATE}_priority_exp${EXP_NUM}"
+    EXP_DIR="experiments/${EXP_DATE}_threshold_exp${EXP_NUM}"
 done
 mkdir -p "$EXP_DIR/traces"
 CSV_FILE="$HOME/hailo_cpp_test/${EXP_DIR}/results_all.csv"
@@ -19,6 +22,7 @@ TRACES_DIR="$HOME/hailo_cpp_test/${EXP_DIR}/traces"
 echo "실험 폴더: $EXP_DIR"
 echo "CSV 저장: $CSV_FILE"
 echo "HRTT 저장: $TRACES_DIR"
+echo "조건: threshold = priority (THRESHOLD_EQ_PRIORITY=1)"
 echo ""
 
 compile_and_run() {
@@ -32,10 +36,10 @@ compile_and_run() {
 
     mkdir -p "$TRACES_DIR"
 
-    # 파라미터 수정
+    # 파라미터 수정 (threshold는 cpp에서 priority로 자동 설정 → sed 불필요)
     sed -i "s/#define BATCH_SIZE.*/#define BATCH_SIZE      1/" infer_scheduler.cpp
-    sed -i "s/#define THRESHOLD .*/#define THRESHOLD       1/" infer_scheduler.cpp
     sed -i "s/#define TIMEOUT_MS.*/#define TIMEOUT_MS      0/" infer_scheduler.cpp
+    sed -i "s/#define THRESHOLD_EQ_PRIORITY.*/#define THRESHOLD_EQ_PRIORITY 1/" infer_scheduler.cpp
     sed -i "s/#define USE_DET.*/#define USE_DET    $USE_D/" infer_scheduler.cpp
     sed -i "s/#define USE_SEG.*/#define USE_SEG    $USE_S/" infer_scheduler.cpp
     sed -i "s/#define USE_POSE.*/#define USE_POSE   $USE_P/" infer_scheduler.cpp
@@ -46,15 +50,13 @@ compile_and_run() {
     echo "파라미터 확인:"
     grep "#define BATCH_SIZE\|#define THRESHOLD\|#define TIMEOUT\|#define USE\|#define PRIORITY" infer_scheduler.cpp
 
-    # 컴파일 (조건당 1회만 컴파일, run 반복 시 재컴파일 불필요하나 안전하게 유지)
+    # 컴파일
     g++ infer_scheduler.cpp -o infer_scheduler -lhailort $(pkg-config --cflags --libs opencv4) -lpthread
     if [ $? -ne 0 ]; then echo "컴파일 실패!"; return; fi
 
     # npu_log 초기화
     > npu_log.txt
     rm -f /tmp/hmon_files/*
-
-    # 이전 unnamed HRTT 파일 제거
     rm -f "$TRACES_DIR"/hailort_*.hrtt
 
     # NPU 모니터링 백그라운드
@@ -69,7 +71,7 @@ compile_and_run() {
     export HAILO_TRACE_PATH="$TRACES_DIR"
     export HAILO_MONITOR=1
 
-    # 추론 실행 (run_id, csv_path 인자 전달)
+    # 추론 실행
     ./infer_scheduler $RUN_ID "$CSV_FILE"
 
     # NPU 종료
@@ -90,17 +92,11 @@ compile_and_run() {
         NEW_NAME="${TRACES_DIR}/${USE_D}D-${USE_S}S-${USE_P}P_${PRI_D}PD-${PRI_S}PS-${PRI_P}PP_run${RUN_ID}_${TIMESTAMP}.hrtt"
         mv "$LATEST_HRTT" "$NEW_NAME"
         echo "HRTT: $NEW_NAME"
-
-        if [ -f "${TRACES_DIR}/runtime_report.html" ]; then
-            HTML_NAME="${TRACES_DIR}/${USE_D}D-${USE_S}S-${USE_P}P_${PRI_D}PD-${PRI_S}PS-${PRI_P}PP_run${RUN_ID}_${TIMESTAMP}.html"
-            cp "${TRACES_DIR}/runtime_report.html" "$HTML_NAME"
-            echo "HTML: $HTML_NAME"
-        fi
     else
         echo "경고: HRTT 파일이 생성되지 않았습니다."
     fi
 
-    # NPU 파싱 (csv 경로 전달)
+    # NPU 파싱
     python3 parse_npu_log.py "$CSV_FILE"
 
     echo "완료! (Run $RUN_ID)"
@@ -108,24 +104,6 @@ compile_and_run() {
 }
 
 priorities=(0 15 31)
-
-echo "===== Single 실험 (9개 조건 × ${REPEAT}회) ====="
-
-for p in "${priorities[@]}"; do
-    for run in $(seq 1 $REPEAT); do
-        compile_and_run 1 0 0 $p 0 0 $run
-    done
-done
-for p in "${priorities[@]}"; do
-    for run in $(seq 1 $REPEAT); do
-        compile_and_run 0 1 0 0 $p 0 $run
-    done
-done
-for p in "${priorities[@]}"; do
-    for run in $(seq 1 $REPEAT); do
-        compile_and_run 0 0 1 0 0 $p $run
-    done
-done
 
 echo "===== 2개 Multi 실험 (27개 조건 × ${REPEAT}회) ====="
 
@@ -163,4 +141,4 @@ for pd in "${priorities[@]}"; do
     done
 done
 
-echo "===== 모든 실험 완료! (63개 조건 × ${REPEAT}회 = $((63 * REPEAT))회) ====="
+echo "===== threshold 실험 완료! (54개 조건 × ${REPEAT}회 = $((54 * REPEAT))회) ====="

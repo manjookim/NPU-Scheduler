@@ -101,7 +101,9 @@ def update_csv(csv_path, log_path, batch, threshold, timeout,
     print(f"CSV 저장 완료: {csv_path}")
 
 if __name__ == "__main__":
-    CSV_PATH = "/home/rpi1/hailo_cpp_test/results_all.csv"
+    import sys
+    # argv[1]: csv_path (optional, 기본값 사용)
+    CSV_PATH = sys.argv[1] if len(sys.argv) > 1 else "/home/rpi1/hailo_cpp_test/results_all.csv"
     LOG_PATH = "/home/rpi1/hailo_cpp_test/npu_log.txt"
     CPP_PATH = "/home/rpi1/hailo_cpp_test/infer_scheduler.cpp"
 

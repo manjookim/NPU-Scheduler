@@ -16,7 +16,10 @@
 
 // ========== 파라미터 설정 ==========
 #define BATCH_SIZE      1
+#define NUM_IMAGES      0     // 모델당 사용할 검증 이미지 수 (0 = 전체 사용, sampled_val2017 = 673장)
 #define THRESHOLD       1
+#define THRESHOLD_EQ_PRIORITY 1  // 1: 각 모델 threshold = 해당 모델 priority (threshold 실험)
+                                 // 0: 모든 모델 threshold = THRESHOLD 고정값 (기존 실험)
 #define TIMEOUT_MS      0
 #define PRIORITY_DET    0
 #define PRIORITY_SEG    0
@@ -30,8 +33,9 @@
 #define DET_HEF  "/home/rpi1/hailo-rpi5-examples/resources/yolov8s_h8l.hef"
 #define SEG_HEF  "/home/rpi1/hailo-rpi5-examples/resources/yolov8s_seg.hef"
 #define POSE_HEF "/home/rpi1/hailo-rpi5-examples/resources/yolov8s_pose_h8l.hef"
-#define IMG_DIR  "/home/rpi1/datasets/coco/val2017/"
-#define CSV_PATH "/home/rpi1/hailo_cpp_test/results_all.csv"
+#define IMG_DIR  "/home/rpi1/datasets/sampled_val2017/"
+// CSV_PATH는 argv[2]로 런타임에 전달받음 (기본값은 하드코딩 경로)
+#define CSV_PATH_DEFAULT "/home/rpi1/hailo_cpp_test/results_all.csv"
 
 #define DET_OUTPUT_COUNT  1
 #define SEG_OUTPUT_COUNT  10
@@ -82,17 +86,24 @@ struct CtxSwitches {
     long nonvoluntary;
 };
 
-CtxSwitches read_process_ctx_switches(pid_t pid) {
+// 호출한 스레드 자신의 context switch 읽기.
+// /proc/thread-self/status 는 현재 실행 중인 "스레드"의 상태를 가리킴 (Linux 3.17+).
+// 주의: /proc/[PID]/status(메인 스레드)만 읽으면 추론이 도는 워커 스레드의 switch가 누락됨.
+//       또 워커 스레드는 join 시점에 이미 종료돼 /proc/[PID]/task/* 에서도 사라지므로,
+//       각 추론 스레드가 자기 자신의 값을 측정해 합산하는 방식이 정확함.
+CtxSwitches read_thread_ctx_switches() {
     CtxSwitches cs = {0, 0};
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/status", pid);
-    std::ifstream f(path);
+    std::ifstream f("/proc/thread-self/status");
     std::string line;
+    long v;
     while (std::getline(f, line)) {
-        if (line.find("voluntary_ctxt_switches:") != std::string::npos)
-            sscanf(line.c_str(), "voluntary_ctxt_switches: %ld", &cs.voluntary);
-        else if (line.find("nonvoluntary_ctxt_switches:") != std::string::npos)
-            sscanf(line.c_str(), "nonvoluntary_ctxt_switches: %ld", &cs.nonvoluntary);
+        // sscanf는 문자열 맨 앞부터 매칭하므로, "nonvoluntary..." 줄에서
+        // "voluntary..." 포맷은 자동으로 실패함 (부분문자열 오매칭 방지).
+        // 반드시 nonvoluntary를 먼저 검사할 필요는 없으나, 명확성을 위해 분리.
+        if (sscanf(line.c_str(), "nonvoluntary_ctxt_switches: %ld", &v) == 1)
+            cs.nonvoluntary = v;
+        else if (sscanf(line.c_str(), "voluntary_ctxt_switches: %ld", &v) == 1)
+            cs.voluntary = v;
     }
     return cs;
 }
@@ -146,7 +157,9 @@ void inference_thread(hailo_configured_network_group network_group,
                       size_t output_count,
                       const char* model_name,
                       double& total_latency,
-                      int& total_count) {
+                      int& total_count,
+                      long& thread_vol_ctx,
+                      long& thread_nonvol_ctx) {
     size_t input_count = 1;
     hailo_input_vstream_params_by_name_t input_params[1];
     hailo_output_vstream_params_by_name_t output_params[16];
@@ -163,6 +176,9 @@ void inference_thread(hailo_configured_network_group network_group,
     double latency_sum = 0;
     int count = 0;
     int batch_count = 0;
+
+    // ── context switch 측정 시작 (추론 루프 구간만) ──
+    CtxSwitches ctx0 = read_thread_ctx_switches();
 
     for (size_t idx = 0; idx + BATCH_SIZE <= images.size(); idx += BATCH_SIZE) {
         // ── 전처리 (latency 측정 제외) ──
@@ -206,6 +222,11 @@ void inference_thread(hailo_configured_network_group network_group,
         }
     }
 
+    // ── context switch 측정 종료 ──
+    CtxSwitches ctx1 = read_thread_ctx_switches();
+    thread_vol_ctx    = ctx1.voluntary    - ctx0.voluntary;
+    thread_nonvol_ctx = ctx1.nonvoluntary - ctx0.nonvoluntary;
+
     total_latency = batch_count > 0 ? latency_sum / batch_count : -1;
     total_count = count;
 
@@ -218,15 +239,16 @@ void inference_thread(hailo_configured_network_group network_group,
 
 // ========== CSV 저장 ==========
 
-void save_csv(int run_id,
+void save_csv(const char* csv_path,
+              int run_id,
               double det_lat, double seg_lat, double pose_lat,
               double cpu, double mem,
               long vol_ctx, long nonvol_ctx) {
-    std::ifstream check(CSV_PATH);
+    std::ifstream check(csv_path);
     bool write_header = !check.good();
     check.close();
 
-    std::ofstream f(CSV_PATH, std::ios::app);
+    std::ofstream f(csv_path, std::ios::app);
     if (write_header)
         f << "run_id,use_det,use_seg,use_pose,batch,threshold,timeout_ms,"
           << "priority_det,priority_seg,priority_pose,"
@@ -241,9 +263,12 @@ void save_csv(int run_id,
         return l >= 0 ? std::to_string(l) : "None";
     };
 
+    // threshold 실험에서는 모델별 threshold=priority 이므로 "=priority"로 기록
+    std::string thr_str = THRESHOLD_EQ_PRIORITY ? std::string("=priority") : std::to_string(THRESHOLD);
+
     f << run_id << ","
       << USE_DET << "," << USE_SEG << "," << USE_POSE << ","
-      << BATCH_SIZE << "," << THRESHOLD << "," << TIMEOUT_MS << ","
+      << BATCH_SIZE << "," << thr_str << "," << TIMEOUT_MS << ","
       << val(USE_DET, PRIORITY_DET) << ","
       << val(USE_SEG, PRIORITY_SEG) << ","
       << val(USE_POSE, PRIORITY_POSE) << ","
@@ -253,14 +278,16 @@ void save_csv(int run_id,
       << cpu << "," << mem << ","
       << vol_ctx << "," << nonvol_ctx << ",\n";  // npu_percent는 parse_npu_log.py가 채움
     f.close();
-    printf("결과 저장: %s\n", CSV_PATH);
+    printf("결과 저장: %s\n", csv_path);
 }
 
 // ========== main ==========
 
 int main(int argc, char* argv[]) {
-    // run_id: 스크립트에서 첫 번째 인자로 전달 (없으면 1)
+    // argv[1]: run_id (없으면 1)
+    // argv[2]: csv_path (없으면 기본값)
     int run_id = (argc > 1) ? atoi(argv[1]) : 1;
+    const char* csv_path = (argc > 2) ? argv[2] : CSV_PATH_DEFAULT;
 
     pid_t my_pid = getpid();
     printf("PID: %d, Run ID: %d\n", my_pid, run_id);
@@ -307,24 +334,30 @@ int main(int argc, char* argv[]) {
         status = hailo_configure_vdevice(vdevice, hefs[i], &configure_params, &network_groups[i], &ng_size);
         if (status != HAILO_SUCCESS) { printf("%s 네트워크 설정 실패\n", models[i].name); return 1; }
 
-        hailo_set_scheduler_threshold(network_groups[i], THRESHOLD, NULL);
+        // threshold 실험: 각 모델 threshold = 해당 모델 priority (0이면 0 그대로)
+        uint32_t thr = THRESHOLD_EQ_PRIORITY ? (uint32_t)models[i].priority : (uint32_t)THRESHOLD;
+        hailo_set_scheduler_threshold(network_groups[i], thr, NULL);
         hailo_set_scheduler_timeout(network_groups[i], TIMEOUT_MS, NULL);
         hailo_set_scheduler_priority(network_groups[i], models[i].priority, NULL);
 
-        printf("%s 설정 완료! (batch=%d, threshold=%d, timeout=%d, priority=%d)\n",
-            models[i].name, BATCH_SIZE, THRESHOLD, TIMEOUT_MS, models[i].priority);
+        printf("%s 설정 완료! (batch=%d, threshold=%u, timeout=%d, priority=%d)\n",
+            models[i].name, BATCH_SIZE, thr, TIMEOUT_MS, models[i].priority);
         active_count++;
     }
 
     std::vector<std::string> images = get_image_files(IMG_DIR);
-    printf("\n총 이미지 수: %zu장, 활성 모델: %d개\n\n", images.size(), active_count);
+    // 검증 이미지 수 제한 (NUM_IMAGES > 0 일 때만)
+    if (NUM_IMAGES > 0 && images.size() > (size_t)NUM_IMAGES)
+        images.resize(NUM_IMAGES);
+    printf("\n사용 이미지 수: %zu장, 활성 모델: %d개\n\n", images.size(), active_count);
 
     // 측정 시작
-    CtxSwitches ctx_start = read_process_ctx_switches(my_pid);
     CpuStats cpu_start = read_cpu_stats();
 
     double latencies[3] = {-1, -1, -1};
     int counts[3] = {0, 0, 0};
+    long vol_ctx_arr[3]    = {0, 0, 0};
+    long nonvol_ctx_arr[3] = {0, 0, 0};
 
     std::vector<std::thread> threads;
     for (int i = 0; i < 3; i++) {
@@ -332,18 +365,24 @@ int main(int argc, char* argv[]) {
         threads.emplace_back(inference_thread,
             network_groups[i], std::ref(images),
             models[i].output_count, models[i].name,
-            std::ref(latencies[i]), std::ref(counts[i]));
+            std::ref(latencies[i]), std::ref(counts[i]),
+            std::ref(vol_ctx_arr[i]), std::ref(nonvol_ctx_arr[i]));
     }
     for (auto& t : threads) t.join();
 
     // 측정 종료
-    CtxSwitches ctx_end = read_process_ctx_switches(my_pid);
     CpuStats cpu_end = read_cpu_stats();
 
     double final_cpu = calc_cpu_usage(cpu_start, cpu_end);
     double final_mem = read_mem_usage();
-    long vol_ctx   = ctx_end.voluntary    - ctx_start.voluntary;
-    long nonvol_ctx = ctx_end.nonvoluntary - ctx_start.nonvoluntary;
+    // 각 추론 스레드가 측정한 context switch를 합산 (워커 스레드는 join 후 사라지므로
+    // 메인 프로세스 status만으로는 추론 부하의 switch를 잡을 수 없음)
+    long vol_ctx = 0, nonvol_ctx = 0;
+    for (int i = 0; i < 3; i++) {
+        if (!models[i].active) continue;
+        vol_ctx    += vol_ctx_arr[i];
+        nonvol_ctx += nonvol_ctx_arr[i];
+    }
 
     printf("\n========== 실험 결과 ==========\n");
     printf("Run ID: %d\n", run_id);
@@ -356,7 +395,7 @@ int main(int argc, char* argv[]) {
     printf("Context Switches - Voluntary: %ld, NonVoluntary: %ld\n", vol_ctx, nonvol_ctx);
     printf("================================\n");
 
-    save_csv(run_id, latencies[0], latencies[1], latencies[2],
+    save_csv(csv_path, run_id, latencies[0], latencies[1], latencies[2],
              final_cpu, final_mem, vol_ctx, nonvol_ctx);
 
     for (int i = 0; i < 3; i++)

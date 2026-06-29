@@ -18,3 +18,7 @@ __pycache__/
 
 # 기타 불필요 파일
 request.txt
+
+# 데이터셋 (용량 큼, git 제외)
+*.zip
+sampled_val2017/
