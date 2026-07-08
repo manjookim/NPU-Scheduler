@@ -22,3 +22,10 @@ request.txt
 # 데이터셋 (용량 큼, git 제외)
 *.zip
 sampled_val2017/
+
+# 백업/중간 산출물 (재생성 가능, git 제외)
+*.bak.csv
+*.prenancheck.csv
+metrics_prithr.json
+missing_conditions.json
+results_prithr_raw.csv
