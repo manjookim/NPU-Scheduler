@@ -1,3 +1,0 @@
-run_id,use_det,use_seg,use_pose,batch,threshold_det,threshold_seg,threshold_pose,timeout_ms,priority_det,priority_seg,priority_pose,det_latency_ms,seg_latency_ms,pose_latency_ms,cpu_percent,mem_percent,voluntary_ctx_switches,nonvoluntary_ctx_switches,npu_percent
-1,1,1,1,32,1,1,1,1000,15,15,15,4574.170953,4673.168689,4542.429397,19.6799,33.9984,15831,269,97.2624
-1,1,1,1,32,16,1,1,1000,15,15,15,4662.136595,4708.267266,4578.157874,19.7715,34.149,15735,291,97.6693

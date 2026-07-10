@@ -1,6 +1,8 @@
-# HailoRT 프로파일 결과물
-hrtt/
-html/
+# HailoRT 프로파일 결과물 (루트의 트레이스/리포트 출력 폴더만 제외.
+# 앞에 /를 붙여 repo 루트에 고정 — 안 그러면 tools/hrtt/ 같은 동명의 하위 폴더까지
+# 같이 무시돼서 tools/hrtt/*.py 소스 코드가 git에 전혀 안 올라가는 버그가 있었음)
+/hrtt/
+/html/
 
 # Claude 메모리
 memory/
