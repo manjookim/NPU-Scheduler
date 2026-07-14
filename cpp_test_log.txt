@@ -1,0 +1,24 @@
+nohup: ignoring input
+데모 폴더: experiments/2026-07-09_cpp_test3
+
+======================================
+[ctrl] Det thr=1 / Seg thr=1 / Pose thr=1 (pri 15-15-15, timeout=1000, batch=32)
+======================================
+VDevice 생성 성공!
+  [적용확인] Detection: threshold=1 [OK], timeout=1000 [OK], priority=15 [OK]
+  [적용확인] Segmentation: threshold=1 [OK], timeout=1000 [OK], priority=15 [OK]
+  [적용확인] Pose: threshold=1 [OK], timeout=1000 [OK], priority=15 [OK]
+추론 완료 (모델당 100장)
+HRTT: ctrl_Dthr1_Sthr1_Pthr1_2026-07-09_12-23-41.hrtt
+
+======================================
+[test] Det thr=16 / Seg thr=1 / Pose thr=1 (pri 15-15-15, timeout=1000, batch=32)
+======================================
+VDevice 생성 성공!
+  [적용확인] Detection: threshold=16 [OK], timeout=1000 [OK], priority=15 [OK]
+  [적용확인] Segmentation: threshold=1 [OK], timeout=1000 [OK], priority=15 [OK]
+  [적용확인] Pose: threshold=1 [OK], timeout=1000 [OK], priority=15 [OK]
+추론 완료 (모델당 100장)
+HRTT: test_Dthr16_Sthr1_Pthr1_2026-07-09_12-23-50.hrtt
+
+===== 데모 완료! (ctrl vs test) =====

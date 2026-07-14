@@ -1,62 +1,144 @@
-#include <hailo/hailort.h>
+/**
+ * infer_scheduler.cpp
+ * ------------------------------------------------------------------------
+ * Hailo-8L (Raspberry Pi 5) 위에서 Detection / Segmentation / Pose 세 모델을
+ * HailoRT Model Scheduler(ROUND_ROBIN)로 "동시에" 추론하면서, 모델별로
+ *   priority / threshold / timeout / batch_size
+ * 를 독립적으로 설정해 벤치마킹하기 위한 C++ 프로그램.
+ *
+ * 입력 데이터: COCO val2017 샘플 이미지(IMG_DIR, 기본 최대 600장) — 더미 버퍼가 아닌
+ *            실제 이미지를 읽어 letterbox 전처리 후 추론에 사용한다.
+ *
+ * 스케줄러 파라미터 적용 근거 (공식 문서/예제, github.com/hailo-ai/hailort, hailo8 브랜치):
+ *   - hailort/libhailort/include/hailo/network_group.hpp
+ *       set_scheduler_timeout(const std::chrono::milliseconds&, network_name="")
+ *         -> 기본값 0ms. "적어도 한 번의 요청이 들어온 뒤" 이 시간이 지나면
+ *            threshold 미달이어도 강제로 실행 자격을 얻는다.
+ *       set_scheduler_threshold(uint32_t, network_name="")
+ *         -> 기본값 1. 큐에 threshold개 요청이 쌓여야 실행 자격을 얻는다(단, timeout이
+ *            먼저 지나면 그 전에도 자격을 얻음 — 위 timeout 설명 참고).
+ *       set_scheduler_priority(uint8_t, network_name="")
+ *         -> 기본값 HAILO_SCHEDULER_PRIORITY_NORMAL. 값이 클수록 우선.
+ *       (주의: 세 함수 모두 "network_name 지정 시 특정 네트워크만 설정"은 아직 미지원 —
+ *        네트워크그룹 전체 단위로만 적용됨. 본 코드는 모델당 네트워크그룹을 하나씩
+ *        따로 configure하므로 문제 없음.)
+ *   - hailort/libhailort/examples/cpp/switch_network_groups_example/switch_network_groups_example.cpp
+ *       VDevice::create -> create_configure_params(hef) -> batch_size 설정 -> configure(hef)
+ *       -> set_scheduler_timeout/threshold/priority -> VStreamsBuilder::create_vstreams(*ng, {}, FORMAT_TYPE)
+ *     본 파일의 구조/시그니처는 위 공식 예제를 그대로 따른다.
+ *
+ * 참고(프로젝트 문서): PROJECT_HANDOFF.md, README.md, docs/setup.md, memory/findings.md
+ *   - threshold 효과를 실제로 관측하려면 timeout > 0 이어야 하고(§7),
+ *     입력을 한꺼번에 다 밀어넣지 말고 NPU 처리량 근처 속도로 흘려보내야
+ *     큐가 상시 포화되지 않아 threshold/timeout이 의미를 가진다.
+ *     -> 아래 INPUT_FPS 로 입력 속도를 제한할 수 있다 (0 = 제한 없음/최대속도).
+ *
+ * 빌드 (RPi):
+ *   g++ infer_scheduler.cpp -o infer_scheduler -lhailort $(pkg-config --cflags --libs opencv4) -lpthread -std=c++17
+ *
+ * 실행:
+ *   ./infer_scheduler [run_id]
+ *
+ * 현재는 CSV 저장 없이, 콘솔의 [적용확인] 로그 + HRTT 트레이스만으로 파라미터
+ * 적용 여부를 확인하는 것이 목적이다. 아래 환경변수를 설정하고 실행하면 HRTT가
+ * 생성되고, PC/WSL에서 `hailo runtime-profiler <파일>.hrtt`로 변환한 HTML에서
+ * `core_op_set_value` 이벤트로 실제 적용된 threshold/timeout/priority 값을 확인할 수 있다
+ * (PROJECT_HANDOFF.md §6 참고. setter가 HAILO_SUCCESS를 반환해도 실제 반영은
+ * HRTT로 재확인하는 것이 정확함).
+ *
+ * HRTT 트레이스:
+ *   export HAILO_TRACE=scheduler
+ *   export HAILO_TRACE_TIME_IN_SECONDS_BOUNDED_DUMP=30
+ *   export HAILO_TRACE_PATH=/path/to/traces
+ *   export HAILO_MONITOR=1
+ * ------------------------------------------------------------------------
+ */
+
+#include "hailo/hailort.hpp"
 #include <opencv2/opencv.hpp>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+
+#include <iostream>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
 #include <chrono>
-#include <vector>
-#include <string>
-#include <dirent.h>
-#include <fstream>
-#include <sstream>
 #include <thread>
 #include <mutex>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <sstream>
+#include <dirent.h>
 #include <algorithm>
 #include <unistd.h>
 
-// ========== 파라미터 설정 ==========
-#define BATCH_SIZE      1
-#define NUM_IMAGES      0     // 모델당 사용할 검증 이미지 수 (0 = 전체 사용, sampled_val2017 = 673장)
-#define INPUT_FPS       0     // 입력 속도 제한(모델당 초당 프레임). 0 = 무제한(최대속도).
-                              // >0이면 큐가 항상 꽉 차지 않아 threshold 효과가 관찰됨(실시간 스트리밍 모사)
-#define THRESHOLD       1
-#define THRESHOLD_EQ_PRIORITY 0  // 1: 각 모델 threshold = 해당 모델 priority (threshold 실험)
-                                 // 0: 모든 모델 threshold = THRESHOLD 고정값 (기존 실험)
-#define THRESHOLD_PER_MODEL 1    // 1: 모델별 독립 threshold(THRESHOLD_DET/SEG/POSE) 사용 (priority×threshold 조합 실험)
-#define THRESHOLD_DET   1
-#define THRESHOLD_SEG   1
-#define THRESHOLD_POSE  1
-#define TIMEOUT_MS      0
-#define PRIORITY_DET    0
-#define PRIORITY_SEG    0
-#define PRIORITY_POSE   0
+using namespace hailort;
 
+// ========================= 파라미터 설정 (모델별로 다르게) =========================
+// [실기 확인된 제약, 공식 문서에 명시 안 됨] threshold는 반드시 그 모델의 batch_size
+// 이하여야 한다. 초과 시 set_scheduler_threshold가 HAILO_INVALID_ARGUMENT로 실패하고
+// (HailoRT 로그: "Threshold must be equal or lower than the maximum batch size!"),
+// 해당 모델은 threshold가 기본값(1)으로 남는다 — [적용확인] 로그의 [실패] 표시로 알 수 있음.
+// 즉 아래 THRESHOLD_* <= BATCH_* 를 항상 지킬 것.
+
+// 모델별 batch_size (네트워크그룹 입출력 큐 크기 — 공식 문서: 클수록 pre/post-process가
+// 하드웨어 추론과 병렬화되어 다른 스케줄러 파라미터가 더 잘 작동함)
+#define BATCH_DET       4
+#define BATCH_SEG       8
+#define BATCH_POSE      2
+
+// threshold: 네트워크그룹이 스케줄될 "자격"을 얻기 위한 최소 누적 요청 수 (기본값 1)
+// 반드시 threshold <= 같은 줄의 batch_size (위 제약 참고)
+// [검증 완료] threshold(99) > batch(8)로 깨서 테스트한 결과, core_op_set_value 트레이스에
+// 거부된 값은 실제로 안 남는 것을 확인함(verify_params.py로 (미적용!) 확인). 정상값으로 복구.
+#define THRESHOLD_DET   0
+#define THRESHOLD_SEG   0
+#define THRESHOLD_POSE  0
+
+// timeout(ms): threshold 미달이어도 최소 1프레임 + 이 시간이 지나면 강제로 실행 자격 부여 (기본값 0)
+#define TIMEOUT_DET_MS   0
+#define TIMEOUT_SEG_MS   0
+#define TIMEOUT_POSE_MS  0
+
+// priority: 0~31, 클수록 우선 (기본값 16=NORMAL). 스케줄 가능한 여러 모델 중 이 값이
+// 가장 큰 모델부터 확인한다. 동일하면 Round-Robin.
+#define PRIORITY_DET    15
+#define PRIORITY_SEG    15
+#define PRIORITY_POSE   15
+
+// 어떤 모델을 이번 실행에 포함할지 (0/1)
 #define USE_DET    1
 #define USE_SEG    1
 #define USE_POSE   1
-// ====================================
 
+// 입력 속도 제한 (모델당 초당 프레임 수). 0 = 제한 없음(최대 속도로 큐를 채움 -> 큐가
+// 항상 포화 상태가 되어 threshold/timeout 효과가 거의 관측되지 않음, findings.md 참고).
+// threshold/timeout 효과를 보고 싶다면 0보다 큰 값(예: NPU 처리량 근처)으로 설정할 것.
+#define INPUT_FPS       0
+
+// 사용할 검증 이미지 수 (0 = IMG_DIR의 전체 이미지 사용)
+#define NUM_IMAGES      600
+// =====================================================================================
+
+// HEF 경로 (Raspberry Pi 5, hailo-rpi5-examples 리소스)
 #define DET_HEF  "/home/rpi1/hailo-rpi5-examples/resources/yolov8s_h8l.hef"
 #define SEG_HEF  "/home/rpi1/hailo-rpi5-examples/resources/yolov8s_seg.hef"
 #define POSE_HEF "/home/rpi1/hailo-rpi5-examples/resources/yolov8s_pose_h8l.hef"
-#define IMG_DIR  "/home/rpi1/datasets/sampled_val2017/"
-// CSV_PATH는 argv[2]로 런타임에 전달받음 (기본값은 하드코딩 경로)
-#define CSV_PATH_DEFAULT "/home/rpi1/hailo_cpp_test/results_all.csv"
 
-#define DET_OUTPUT_COUNT  1
-#define SEG_OUTPUT_COUNT  10
-#define POSE_OUTPUT_COUNT 9
+// 입력 데이터셋 경로: 조교 제공 sampled_val2017 (RPi에 이미 전송 완료).
+// RPi의 실제 저장 위치가 다르면 이 값만 수정 후 재컴파일할 것.
+#define IMG_DIR  "/home/rpi1/datasets/sampled_val2017/"
 
 std::mutex print_mutex;
 
-// ========== 시스템 모니터링 ==========
+// ========================= 시스템 모니터링 (CPU/MEM/Context Switch) =========================
 
 struct CpuStats {
-    long user, nice, system, idle, iowait, irq, softirq;
+    long user = 0, nice = 0, system = 0, idle = 0, iowait = 0, irq = 0, softirq = 0;
 };
 
 CpuStats read_cpu_stats() {
-    CpuStats s = {};
+    CpuStats s;
     std::ifstream f("/proc/stat");
     std::string line;
     std::getline(f, line);
@@ -65,12 +147,14 @@ CpuStats read_cpu_stats() {
     return s;
 }
 
-double calc_cpu_usage(CpuStats& s1, CpuStats& s2) {
+double calc_cpu_usage(const CpuStats& s1, const CpuStats& s2) {
     long idle1 = s1.idle + s1.iowait;
     long idle2 = s2.idle + s2.iowait;
     long total1 = s1.user + s1.nice + s1.system + s1.idle + s1.iowait + s1.irq + s1.softirq;
     long total2 = s2.user + s2.nice + s2.system + s2.idle + s2.iowait + s2.irq + s2.softirq;
-    return 100.0 * (1.0 - (double)(idle2 - idle1) / (double)(total2 - total1));
+    long dt = total2 - total1;
+    if (dt <= 0) return 0.0;
+    return 100.0 * (1.0 - (double)(idle2 - idle1) / (double)dt);
 }
 
 double read_mem_usage() {
@@ -83,29 +167,20 @@ double read_mem_usage() {
         if (line.find("MemAvailable:") != std::string::npos)
             sscanf(line.c_str(), "MemAvailable: %ld kB", &available);
     }
+    if (total <= 0) return 0.0;
     return 100.0 * (1.0 - (double)available / (double)total);
 }
 
-// 프로세스별 context switch: /proc/[PID]/status에서 읽기
-struct CtxSwitches {
-    long voluntary;
-    long nonvoluntary;
-};
+struct CtxSwitches { long voluntary = 0, nonvoluntary = 0; };
 
-// 호출한 스레드 자신의 context switch 읽기.
-// /proc/thread-self/status 는 현재 실행 중인 "스레드"의 상태를 가리킴 (Linux 3.17+).
-// 주의: /proc/[PID]/status(메인 스레드)만 읽으면 추론이 도는 워커 스레드의 switch가 누락됨.
-//       또 워커 스레드는 join 시점에 이미 종료돼 /proc/[PID]/task/* 에서도 사라지므로,
-//       각 추론 스레드가 자기 자신의 값을 측정해 합산하는 방식이 정확함.
+// 호출한 스레드 자신의 context switch 읽기 (/proc/thread-self/status, Linux 3.17+).
+// 워커 스레드는 join 시점에 이미 사라지므로, 각 스레드가 자기 값을 측정해 합산해야 정확하다.
 CtxSwitches read_thread_ctx_switches() {
-    CtxSwitches cs = {0, 0};
+    CtxSwitches cs;
     std::ifstream f("/proc/thread-self/status");
     std::string line;
     long v;
     while (std::getline(f, line)) {
-        // sscanf는 문자열 맨 앞부터 매칭하므로, "nonvoluntary..." 줄에서
-        // "voluntary..." 포맷은 자동으로 실패함 (부분문자열 오매칭 방지).
-        // 반드시 nonvoluntary를 먼저 검사할 필요는 없으나, 명확성을 위해 분리.
         if (sscanf(line.c_str(), "nonvoluntary_ctxt_switches: %ld", &v) == 1)
             cs.nonvoluntary = v;
         else if (sscanf(line.c_str(), "voluntary_ctxt_switches: %ld", &v) == 1)
@@ -114,14 +189,12 @@ CtxSwitches read_thread_ctx_switches() {
     return cs;
 }
 
-// ========== 이미지 유틸 ==========
+// ========================= 이미지 유틸 =========================
 
-// Letterbox: 비율 유지 resize + gray(114) 패딩 → 640x640
-// YOLOv8 학습 전처리와 동일 (RoundRobin.py letterbox 참고)
+// Letterbox: 비율 유지 resize + gray(114) 패딩 -> target_size x target_size
+// (YOLOv8 학습 전처리와 동일; 3개 모델 모두 640x640x3 입력, docs/setup.md 참고)
 cv::Mat letterbox(const cv::Mat& img, int target_size = 640) {
-    int orig_h = img.rows;
-    int orig_w = img.cols;
-
+    int orig_h = img.rows, orig_w = img.cols;
     float scale = std::min((float)target_size / orig_h, (float)target_size / orig_w);
     int new_h = (int)(orig_h * scale);
     int new_w = (int)(orig_w * scale);
@@ -129,7 +202,6 @@ cv::Mat letterbox(const cv::Mat& img, int target_size = 640) {
     cv::Mat resized;
     cv::resize(img, resized, cv::Size(new_w, new_h));
 
-    // 패딩 계산 (중앙 배치)
     int pad_top    = (target_size - new_h) / 2;
     int pad_bottom = target_size - new_h - pad_top;
     int pad_left   = (target_size - new_w) / 2;
@@ -137,7 +209,7 @@ cv::Mat letterbox(const cv::Mat& img, int target_size = 640) {
 
     cv::Mat out;
     cv::copyMakeBorder(resized, out, pad_top, pad_bottom, pad_left, pad_right,
-                       cv::BORDER_CONSTANT, cv::Scalar(114, 114, 114));
+                        cv::BORDER_CONSTANT, cv::Scalar(114, 114, 114));
     return out;
 }
 
@@ -148,49 +220,72 @@ std::vector<std::string> get_image_files(const char* dir_path) {
     struct dirent* entry;
     while ((entry = readdir(dir)) != NULL) {
         std::string name = entry->d_name;
-        if (name.find(".jpg") != std::string::npos)
+        if (name.size() > 4 &&
+            (name.find(".jpg") != std::string::npos || name.find(".JPG") != std::string::npos))
             files.push_back(std::string(dir_path) + name);
     }
     closedir(dir);
-    std::sort(files.begin(), files.end());  // 실험 재현성을 위해 정렬
+    std::sort(files.begin(), files.end());  // 실험 재현성을 위해 정렬(항상 같은 부분집합 사용)
     return files;
 }
-
-// ========== 비동기 추론 (producer/consumer) ==========
-// writer 스레드가 입력 큐를 계속 채우고(큐가 가득 차면 write가 블로킹됨),
-// reader 스레드가 출력을 뽑는다. 입력 큐가 '점진적으로' 쌓여야 scheduler의
-// threshold(큐에 N개 쌓이면 활성화)/timeout이 실제로 의미를 가진다.
-// (기존 동기식 write→read 반복은 큐가 한 번에 비워져 threshold가 무력화됐음)
 
 static inline double now_ms() {
     return std::chrono::duration<double, std::milli>(
         std::chrono::high_resolution_clock::now().time_since_epoch()).count();
 }
 
-void async_inference(hailo_configured_network_group network_group,
-                     std::vector<cv::Mat>& pre,   // 전처리 완료 이미지 (공유, latency 측정서 제외)
-                     size_t output_count,
-                     const char* model_name,
-                     double& total_latency,
-                     int& total_count,
-                     long& thread_vol_ctx,
-                     long& thread_nonvol_ctx) {
-    size_t input_count = 1;
-    hailo_input_vstream_params_by_name_t input_params[1];
-    hailo_output_vstream_params_by_name_t output_params[16];
-    hailo_make_input_vstream_params(network_group, true, HAILO_FORMAT_TYPE_UINT8, input_params, &input_count);
-    hailo_make_output_vstream_params(network_group, true, HAILO_FORMAT_TYPE_FLOAT32, output_params, &output_count);
+// ========================= 모델별 비동기 추론 (producer/consumer) =========================
+// writer 스레드가 입력 큐를 채우고(큐가 가득 차면 write가 블로킹), reader 스레드가
+// 그 모델의 "모든" 출력 vstream을 프레임 단위로 읽는다. INPUT_FPS>0이면 writer가 그
+// 속도로 write를 지연시켜 큐가 점진적으로 쌓이도록 한다 — 이래야 threshold(큐 누적 수)
+// 와 timeout(대기 시간)이 실제로 트리거될 조건이 생긴다(동기식으로 한꺼번에 밀어넣으면
+// 큐가 항상 포화되어 threshold가 무의미해짐, memory/findings.md 참고).
+struct ModelResult {
+    double avg_latency_ms = -1;
+    int frame_count = 0;
+    long vol_ctx = 0;
+    long nonvol_ctx = 0;
+    double total_time_s = -1;   // 이 모델이 모든 입력(약 670장)을 처리하는 데 걸린 전체 시간(초)
+};
 
-    hailo_input_vstream input_vstreams[1];
-    hailo_output_vstream output_vstreams[16];
-    hailo_create_input_vstreams(network_group, input_params, input_count, input_vstreams);
-    hailo_create_output_vstreams(network_group, output_params, output_count, output_vstreams);
+// 모델별 실행 구성 (main에서 채움). save_csv에서도 참조하므로 전역에 둔다.
+struct ModelConfig {
+    const char* hef_path;
+    const char* name;
+    int priority;
+    int threshold;
+    int timeout_ms;
+    int batch;
+    bool active;
+};
+
+void run_model_async(const char* model_name,
+                     std::vector<InputVStream>& inputs,
+                     std::vector<OutputVStream>& outputs,
+                     const std::vector<cv::Mat>& pre,
+                     ModelResult& result)
+{
+    if (inputs.empty() || outputs.empty()) {
+        std::lock_guard<std::mutex> lock(print_mutex);
+        std::cerr << "[" << model_name << "] 입력/출력 vstream 없음, 스킵" << std::endl;
+        return;
+    }
+
+    // 프레임 크기 검증 (letterbox 결과가 모델 입력과 안 맞으면 write가 실패/깨질 수 있음)
+    size_t expected = inputs[0].get_frame_size();
+    size_t actual = pre.empty() ? 0 : pre[0].total() * pre[0].elemSize();
+    if (!pre.empty() && expected != actual) {
+        std::lock_guard<std::mutex> lock(print_mutex);
+        std::cerr << "[" << model_name << "] [경고] 프레임 크기 불일치: 모델 기대="
+                   << expected << "B, 전처리 결과=" << actual
+                   << "B (letterbox 크기/채널 수를 모델 입력 shape에 맞게 조정할 것)" << std::endl;
+    }
 
     size_t N = pre.size();
     std::vector<double> enq_ts(N, 0.0), deq_ts(N, 0.0);
     long w_vol = 0, w_nonvol = 0, r_vol = 0, r_nonvol = 0;
+    hailo_status write_status = HAILO_SUCCESS, read_status = HAILO_SUCCESS;
 
-    // writer: 프레임을 큐에 밀어넣음. INPUT_FPS>0이면 그 속도로 제한(큐가 늘 꽉 차지 않게 함).
     std::thread writer([&]() {
         CtxSwitches c0 = read_thread_ctx_switches();
         const double interval_ms = (INPUT_FPS > 0) ? (1000.0 / INPUT_FPS) : 0.0;
@@ -202,27 +297,26 @@ void async_inference(hailo_configured_network_group network_group,
                     std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(next_t - t));
                 next_t += interval_ms;
             }
-            enq_ts[i] = now_ms();  // 전처리 제외, write 직전 시각
-            hailo_vstream_write_raw_buffer(input_vstreams[0],
-                pre[i].data, pre[i].total() * pre[i].elemSize());
+            enq_ts[i] = now_ms();
+            auto status = inputs[0].write(MemoryView(pre[i].data, pre[i].total() * pre[i].elemSize()));
+            if (HAILO_SUCCESS != status) { write_status = status; }
         }
         CtxSwitches c1 = read_thread_ctx_switches();
         w_vol = c1.voluntary - c0.voluntary; w_nonvol = c1.nonvoluntary - c0.nonvoluntary;
     });
 
-    // reader: 프레임별로 모든 출력 스트림을 읽고 수신완료 시각 기록
     std::thread reader([&]() {
         CtxSwitches c0 = read_thread_ctx_switches();
-        size_t osz[16];
-        std::vector<std::vector<uint8_t>> obuf(output_count);
-        for (size_t j = 0; j < output_count; j++) {
-            hailo_get_output_vstream_frame_size(output_vstreams[j], &osz[j]);
-            obuf[j].resize(osz[j]);
-        }
+        std::vector<std::vector<uint8_t>> obuf(outputs.size());
+        for (size_t j = 0; j < outputs.size(); j++)
+            obuf[j].resize(outputs[j].get_frame_size());
+
         for (size_t i = 0; i < N; i++) {
-            for (size_t j = 0; j < output_count; j++)
-                hailo_vstream_read_raw_buffer(output_vstreams[j], obuf[j].data(), osz[j]);
-            deq_ts[i] = now_ms();  // 프레임 i의 모든 출력 수신 완료 시각
+            for (size_t j = 0; j < outputs.size(); j++) {
+                auto status = outputs[j].read(MemoryView(obuf[j].data(), obuf[j].size()));
+                if (HAILO_SUCCESS != status) { read_status = status; }
+            }
+            deq_ts[i] = now_ms();  // 이 프레임의 모든 출력을 다 받은 시각
         }
         CtxSwitches c1 = read_thread_ctx_switches();
         r_vol = c1.voluntary - c0.voluntary; r_nonvol = c1.nonvoluntary - c0.nonvoluntary;
@@ -231,167 +325,216 @@ void async_inference(hailo_configured_network_group network_group,
     writer.join();
     reader.join();
 
-    // latency = 출력수신 - 입력투입 (전처리 제외; 큐대기 + 추론 + 전송 포함 → threshold/timeout 효과 반영)
+    if (HAILO_SUCCESS != write_status || HAILO_SUCCESS != read_status) {
+        std::lock_guard<std::mutex> lock(print_mutex);
+        std::cerr << "[" << model_name << "] [경고] 추론 중 오류 (write=" << write_status
+                   << ", read=" << read_status << ") — 아래 latency는 왜곡됐을 수 있음" << std::endl;
+    }
+
     double sum = 0; int c = 0;
     for (size_t i = 0; i < N; i++)
         if (deq_ts[i] > enq_ts[i]) { sum += (deq_ts[i] - enq_ts[i]); c++; }
-    total_latency = c > 0 ? sum / c : -1;
-    total_count = c;
-    thread_vol_ctx    = w_vol + r_vol;      // writer+reader 두 스레드 합산
-    thread_nonvol_ctx = w_nonvol + r_nonvol;
 
-    hailo_release_input_vstreams(input_vstreams, input_count);
-    hailo_release_output_vstreams(output_vstreams, output_count);
+    result.avg_latency_ms = c > 0 ? sum / c : -1;
+    result.frame_count = c;
+    result.vol_ctx = w_vol + r_vol;
+    result.nonvol_ctx = w_nonvol + r_nonvol;
+
+    // 모델별 전체 추론 시간 = 첫 입력 enqueue ~ 마지막 출력 dequeue 구간
+    // (해당 모델이 모든 프레임을 다 처리하는 데 걸린 실제 wall-time, NPU 공유 경쟁 포함)
+    double first_enq = 0, last_deq = 0;
+    for (size_t i = 0; i < N; i++) {
+        if (enq_ts[i] > 0 && (first_enq == 0 || enq_ts[i] < first_enq)) first_enq = enq_ts[i];
+        if (deq_ts[i] > last_deq) last_deq = deq_ts[i];
+    }
+    result.total_time_s = (last_deq > first_enq) ? (last_deq - first_enq) / 1000.0 : -1;
 
     std::lock_guard<std::mutex> lock(print_mutex);
-    printf("[%s] 완료: 평균 Latency=%.2f ms, 총 %d장 (async)\n", model_name, total_latency, total_count);
+    std::printf("[%s] 완료: 평균 Latency=%.2f ms, %d장, 전체 추론시간=%.2f s (async, INPUT_FPS=%d)\n",
+                model_name, result.avg_latency_ms, result.frame_count, result.total_time_s, INPUT_FPS);
 }
 
-// ========== CSV 저장 ==========
+// ========================= CSV 저장 =========================
+// [핵심] 이 프로그램(추론 단계)에서 "직접 측정 가능한 값"만 채워서 한 행을 append 한다.
+// HRTT/HTML 프로파일러로만 얻을 수 있는 값은 "NaN"으로 남겨두고, 이후
+//   - npu_percent            : tools/monitoring/parse_npu_log.py
+//   - idle_time_pct / switches_per_s / 모델별 avg_fps·avg_latency·max_latency·activation
+//                            : HRTT(.hrtt→.html) 프로파일러 파싱
+// 단계에서 같은 행을 찾아 채운다.
+// 컬럼 순서 = results/nancheck_rerun/results_nancheck_full.csv 스키마와 완전히 동일.
+//
+// 추론 중 직접 채우는 값:
+//   run_id, use_*, batch, threshold_*, timeout_ms, priority_*   (실행 구성)
+//   det/seg/pose_latency_ms                                     (이 코드가 측정한 end-to-end latency)
+//   cpu_percent, mem_percent, voluntary/nonvoluntary_ctx_switches
+//   run_time_s                                                  (추론 구간 실측 wall-time)
+static std::string dtos(double v) {           // 음수(-1)=미측정/비활성 → NaN
+    if (v < 0) return "NaN";
+    std::ostringstream os; os << v; return os.str();
+}
 
-void save_csv(const char* csv_path,
-              int run_id,
-              double det_lat, double seg_lat, double pose_lat,
-              double cpu, double mem,
-              long vol_ctx, long nonvol_ctx) {
-    std::ifstream check(csv_path);
-    bool write_header = !check.good();
-    check.close();
+void save_csv(const std::string& csv_path, int run_id,
+              const std::vector<ModelConfig>& models,   // [0]=Det, [1]=Seg, [2]=Pose 고정 순서
+              const ModelResult results[3],
+              double cpu_percent, double mem_percent,
+              long vol_ctx, long nonvol_ctx, double run_time_s)
+{
+    static const char* HEADER =
+        "run_id,use_det,use_seg,use_pose,batch,"
+        "threshold_det,threshold_seg,threshold_pose,timeout_ms,"
+        "priority_det,priority_seg,priority_pose,"
+        "det_latency_ms,seg_latency_ms,pose_latency_ms,"
+        "cpu_percent,mem_percent,voluntary_ctx_switches,nonvoluntary_ctx_switches,"
+        "npu_percent,switches_per_s,idle_time_pct,run_time_s,"
+        "avg_fps_det,avg_latency_det,max_latency_det,activation_det,"
+        "avg_fps_seg,avg_latency_seg,max_latency_seg,activation_seg,"
+        "avg_fps_pose,avg_latency_pose,max_latency_pose,activation_pose,"
+        "total_time_det_s,total_time_seg_s,total_time_pose_s";  // 모델별 전체 추론시간(추론 중 실측)
 
+    // 파일이 없거나 비어 있으면 헤더부터 쓴다.
+    bool need_header = true;
+    {
+        std::ifstream chk(csv_path);
+        if (chk.good() && chk.peek() != std::ifstream::traits_type::eof())
+            need_header = false;
+    }
     std::ofstream f(csv_path, std::ios::app);
-    if (write_header)
-        f << "run_id,use_det,use_seg,use_pose,batch,"
-          << "threshold_det,threshold_seg,threshold_pose,timeout_ms,"
-          << "priority_det,priority_seg,priority_pose,"
-          << "det_latency_ms,seg_latency_ms,pose_latency_ms,"
-          << "cpu_percent,mem_percent,"
-          << "voluntary_ctx_switches,nonvoluntary_ctx_switches,npu_percent\n";
+    if (!f.is_open()) {
+        std::lock_guard<std::mutex> lock(print_mutex);
+        std::cerr << "[CSV] 열기 실패: " << csv_path << std::endl;
+        return;
+    }
+    if (need_header) f << HEADER << "\n";
 
-    auto val = [](int use, int priority) -> std::string {
-        return use ? std::to_string(priority) : "None";
-    };
-    auto lat = [](double l) -> std::string {
-        return l >= 0 ? std::to_string(l) : "None";
-    };
-    // 모델별 threshold: PER_MODEL면 독립값, EQ_PRIORITY면 priority(0→THRESHOLD), 아니면 THRESHOLD. 비활성=None
-    auto thr = [](int use, int priority, int thr_def) -> std::string {
-        if (!use) return "None";
-        if (THRESHOLD_PER_MODEL) return std::to_string(thr_def);
-        if (THRESHOLD_EQ_PRIORITY) return std::to_string(priority == 0 ? THRESHOLD : priority);
-        return std::to_string(THRESHOLD);
-    };
+    // 비활성 모델의 latency는 NaN(-1) 처리
+    double det_lat  = models[0].active ? results[0].avg_latency_ms : -1;
+    double seg_lat  = models[1].active ? results[1].avg_latency_ms : -1;
+    double pose_lat = models[2].active ? results[2].avg_latency_ms : -1;
+    double det_tot  = models[0].active ? results[0].total_time_s : -1;
+    double seg_tot  = models[1].active ? results[1].total_time_s : -1;
+    double pose_tot = models[2].active ? results[2].total_time_s : -1;
 
-    f << run_id << ","
-      << USE_DET << "," << USE_SEG << "," << USE_POSE << ","
-      << BATCH_SIZE << ","
-      << thr(USE_DET, PRIORITY_DET, THRESHOLD_DET) << ","
-      << thr(USE_SEG, PRIORITY_SEG, THRESHOLD_SEG) << ","
-      << thr(USE_POSE, PRIORITY_POSE, THRESHOLD_POSE) << ","
-      << TIMEOUT_MS << ","
-      << val(USE_DET, PRIORITY_DET) << ","
-      << val(USE_SEG, PRIORITY_SEG) << ","
-      << val(USE_POSE, PRIORITY_POSE) << ","
-      << lat(det_lat) << ","
-      << lat(seg_lat) << ","
-      << lat(pose_lat) << ","
-      << cpu << "," << mem << ","
-      << vol_ctx << "," << nonvol_ctx << ",\n";  // npu_percent는 parse_npu_log.py가 채움
+    std::ostringstream row;
+    row << run_id << ','
+        << (models[0].active ? 1 : 0) << ','
+        << (models[1].active ? 1 : 0) << ','
+        << (models[2].active ? 1 : 0) << ','
+        << models[0].batch << ','                                  // batch (모델 통일값)
+        << models[0].threshold << ',' << models[1].threshold << ',' << models[2].threshold << ','
+        << models[0].timeout_ms << ','                             // timeout_ms (실험에서 모델 통일)
+        << models[0].priority << ',' << models[1].priority << ',' << models[2].priority << ','
+        << dtos(det_lat) << ',' << dtos(seg_lat) << ',' << dtos(pose_lat) << ','
+        << dtos(cpu_percent) << ',' << dtos(mem_percent) << ','
+        << vol_ctx << ',' << nonvol_ctx << ','
+        // ↓ 여기서부터 HRTT/모니터 단계에서 채울 값 → NaN
+        << "NaN" << ','                                            // npu_percent
+        << "NaN" << ','                                            // switches_per_s
+        << "NaN" << ','                                            // idle_time_pct
+        << dtos(run_time_s) << ','                                 // run_time_s (실측)
+        << "NaN,NaN,NaN,NaN,"                                      // det: avg_fps,avg_latency,max_latency,activation
+        << "NaN,NaN,NaN,NaN,"                                      // seg
+        << "NaN,NaN,NaN,NaN,"                                      // pose
+        // ↓ 모델별 전체 추론시간 (추론 중 실측, 비활성=NaN)
+        << dtos(det_tot) << ',' << dtos(seg_tot) << ',' << dtos(pose_tot);
+    f << row.str() << "\n";
     f.close();
-    printf("결과 저장: %s\n", csv_path);
+
+    std::lock_guard<std::mutex> lock(print_mutex);
+    std::printf("[CSV] 저장: %s (run_id=%d, 추론 측정값 기록, HRTT값은 NaN)\n",
+                csv_path.c_str(), run_id);
 }
 
-// ========== main ==========
+// ========================= main =========================
 
-int main(int argc, char* argv[]) {
-    // argv[1]: run_id (없으면 1)
-    // argv[2]: csv_path (없으면 기본값)
+int main(int argc, char* argv[])
+{
     int run_id = (argc > 1) ? atoi(argv[1]) : 1;
-    const char* csv_path = (argc > 2) ? argv[2] : CSV_PATH_DEFAULT;
+    std::string csv_path = (argc > 2) ? argv[2] : "";   // argv[2] 있으면 CSV 저장
 
     pid_t my_pid = getpid();
-    printf("PID: %d, Run ID: %d\n", my_pid, run_id);
+    std::printf("PID: %d, Run ID: %d\n", my_pid, run_id);
 
-    hailo_status status;
-    hailo_vdevice vdevice;
+    // ── VDevice 생성 (스케줄러 Round-Robin) ──
     hailo_vdevice_params_t vdevice_params;
-
     hailo_init_vdevice_params(&vdevice_params);
     vdevice_params.scheduling_algorithm = HAILO_SCHEDULING_ALGORITHM_ROUND_ROBIN;
-    status = hailo_create_vdevice(&vdevice_params, &vdevice);
-    if (status != HAILO_SUCCESS) { printf("VDevice 생성 실패\n"); return 1; }
-    printf("VDevice 생성 성공!\n");
+    auto vdevice_exp = VDevice::create(vdevice_params);
+    if (!vdevice_exp) {
+        std::cerr << "VDevice 생성 실패, status=" << vdevice_exp.status() << std::endl;
+        return (int)vdevice_exp.status();
+    }
+    auto vdevice = vdevice_exp.release();
+    std::cout << "VDevice 생성 성공!" << std::endl;
 
-    struct ModelConfig {
-        const char* hef_path;
-        const char* name;
-        size_t output_count;
-        int priority;
-        int threshold;
-        bool active;
+    std::vector<ModelConfig> models = {
+        {DET_HEF,  "Detection",    PRIORITY_DET,  THRESHOLD_DET,  TIMEOUT_DET_MS,  BATCH_DET,  (bool)USE_DET},
+        {SEG_HEF,  "Segmentation", PRIORITY_SEG,  THRESHOLD_SEG,  TIMEOUT_SEG_MS,  BATCH_SEG,  (bool)USE_SEG},
+        {POSE_HEF, "Pose",         PRIORITY_POSE, THRESHOLD_POSE, TIMEOUT_POSE_MS, BATCH_POSE, (bool)USE_POSE},
     };
 
-    ModelConfig models[] = {
-        {DET_HEF,  "Detection",    DET_OUTPUT_COUNT,  PRIORITY_DET,  THRESHOLD_DET,  (bool)USE_DET},
-        {SEG_HEF,  "Segmentation", SEG_OUTPUT_COUNT,  PRIORITY_SEG,  THRESHOLD_SEG,  (bool)USE_SEG},
-        {POSE_HEF, "Pose",         POSE_OUTPUT_COUNT, PRIORITY_POSE, THRESHOLD_POSE, (bool)USE_POSE},
-    };
+    std::vector<std::shared_ptr<ConfiguredNetworkGroup>> network_groups;
+    std::vector<int> active_model_idx;  // network_groups[k] <-> models[active_model_idx[k]]
 
-    hailo_hef hefs[3];
-    hailo_configured_network_group network_groups[3];
-    int active_count = 0;
+    // ── 모델별: HEF 로드 -> configure(batch) -> 스케줄러 파라미터(threshold/timeout/priority) 설정 ──
+    for (size_t i = 0; i < models.size(); i++) {
+        auto& m = models[i];
+        if (!m.active) continue;
 
-    for (int i = 0; i < 3; i++) {
-        if (!models[i].active) continue;
-        status = hailo_create_hef_file(&hefs[i], models[i].hef_path);
-        if (status != HAILO_SUCCESS) { printf("%s HEF 로드 실패\n", models[i].name); return 1; }
+        auto hef_exp = Hef::create(m.hef_path);
+        if (!hef_exp) { std::cerr << m.name << " HEF 로드 실패" << std::endl; return (int)hef_exp.status(); }
+        auto hef = hef_exp.release();
 
-        hailo_configure_params_t configure_params;
-        hailo_init_configure_params_by_vdevice(hefs[i], vdevice, &configure_params);
-        for (size_t j = 0; j < configure_params.network_group_params_count; j++)
-            configure_params.network_group_params[j].batch_size = BATCH_SIZE;
+        auto cfg_exp = vdevice->create_configure_params(hef);
+        if (!cfg_exp) { std::cerr << m.name << " configure params 실패" << std::endl; return (int)cfg_exp.status(); }
+        auto cfg = cfg_exp.value();
+        for (auto& ng_param : cfg) {
+            ng_param.second.batch_size = m.batch;
+            ng_param.second.power_mode = HAILO_POWER_MODE_ULTRA_PERFORMANCE;
+        }
 
-        size_t ng_size = 1;
-        status = hailo_configure_vdevice(vdevice, hefs[i], &configure_params, &network_groups[i], &ng_size);
-        if (status != HAILO_SUCCESS) { printf("%s 네트워크 설정 실패\n", models[i].name); return 1; }
+        auto ngs_exp = vdevice->configure(hef, cfg);
+        if (!ngs_exp) { std::cerr << m.name << " configure 실패" << std::endl; return (int)ngs_exp.status(); }
+        auto network_group = ngs_exp.value()[0];
 
-        // threshold 결정:
-        //  THRESHOLD_PER_MODEL=1 -> 모델별 독립 threshold (priority×threshold 조합 실험)
-        //  THRESHOLD_EQ_PRIORITY=1 -> threshold=priority (priority=0이면 1)
-        //  둘 다 0 -> 전역 THRESHOLD 고정
-        uint32_t thr;
-        if (THRESHOLD_PER_MODEL)
-            thr = (uint32_t)models[i].threshold;
-        else if (THRESHOLD_EQ_PRIORITY)
-            thr = (models[i].priority == 0) ? (uint32_t)THRESHOLD : (uint32_t)models[i].priority;
-        else
-            thr = (uint32_t)THRESHOLD;
-        // 스케줄러 파라미터 설정. HailoRT엔 getter가 없으므로, setter의 반환 status로
-        // 적용 여부를 확인한다(HAILO_SUCCESS=적용됨). 성공/실패를 모두 명시적으로 로그.
-        hailo_status st_thr = hailo_set_scheduler_threshold(network_groups[i], thr, NULL);
-        hailo_status st_to  = hailo_set_scheduler_timeout(network_groups[i], TIMEOUT_MS, NULL);
-        hailo_status st_pri = hailo_set_scheduler_priority(network_groups[i], models[i].priority, NULL);
-        printf("  [적용확인] %s: threshold=%u [%s], timeout=%d [%s], priority=%d [%s]\n",
-            models[i].name,
-            thr,               (st_thr == HAILO_SUCCESS ? "OK" : "실패"),
-            TIMEOUT_MS,        (st_to  == HAILO_SUCCESS ? "OK" : "실패"),
-            models[i].priority,(st_pri == HAILO_SUCCESS ? "OK" : "실패"));
+        // 실기 확인된 제약: threshold는 batch_size 이하여야 함 (위 정의부 주석 참고).
+        // 어길 경우 set_scheduler_threshold가 실패하며 threshold는 기본값(1)으로 남는다.
+        if (m.threshold > m.batch)
+            std::printf("  [경고] %s: threshold(%d) > batch(%d) — set_scheduler_threshold가 실패할 것으로 예상됨. "
+                        "THRESHOLD_* <= BATCH_*로 맞출 것.\n", m.name, m.threshold, m.batch);
+
+        // 스케줄러 파라미터 설정 (network_group.hpp 공식 시그니처와 동일)
+        auto st_thr = network_group->set_scheduler_threshold((uint32_t)m.threshold);
+        auto st_to  = network_group->set_scheduler_timeout(std::chrono::milliseconds(m.timeout_ms));
+        auto st_pri = network_group->set_scheduler_priority((uint8_t)m.priority);
+        std::printf("  [적용확인] %-13s: batch=%d, threshold=%d [%s], timeout=%dms [%s], priority=%d [%s]\n",
+            m.name, m.batch,
+            m.threshold,  (st_thr == HAILO_SUCCESS ? "OK" : "실패"),
+            m.timeout_ms, (st_to  == HAILO_SUCCESS ? "OK" : "실패"),
+            m.priority,   (st_pri == HAILO_SUCCESS ? "OK" : "실패"));
         if (st_thr != HAILO_SUCCESS || st_to != HAILO_SUCCESS || st_pri != HAILO_SUCCESS)
-            printf("  [경고] %s 일부 파라미터 적용 실패! (status thr=%d to=%d pri=%d)\n",
-                   models[i].name, st_thr, st_to, st_pri);
+            std::printf("  [경고] %s 일부 파라미터 적용 실패! (thr=%d to=%d pri=%d)\n",
+                        m.name, (int)st_thr, (int)st_to, (int)st_pri);
 
-        printf("%s 설정 완료! (batch=%d, threshold=%u, timeout=%d, priority=%d)\n",
-            models[i].name, BATCH_SIZE, thr, TIMEOUT_MS, models[i].priority);
-        active_count++;
+        network_groups.push_back(network_group);
+        active_model_idx.push_back((int)i);
     }
 
+    if (network_groups.empty()) {
+        std::cerr << "활성화된 모델이 없습니다 (USE_DET/USE_SEG/USE_POSE 확인)" << std::endl;
+        return 1;
+    }
+
+    // ── val2017 이미지 로드 + letterbox 전처리 (한 번만 수행, 모든 모델이 공유) ──
     std::vector<std::string> images = get_image_files(IMG_DIR);
-    // 검증 이미지 수 제한 (NUM_IMAGES > 0 일 때만)
+    if (images.empty()) {
+        std::cerr << "[경고] IMG_DIR(" << IMG_DIR << ")에서 이미지를 찾지 못함. "
+                  << "경로를 확인하고 #define IMG_DIR을 수정할 것." << std::endl;
+        return 1;
+    }
     if (NUM_IMAGES > 0 && images.size() > (size_t)NUM_IMAGES)
         images.resize(NUM_IMAGES);
-    printf("\n사용 이미지 수: %zu장, 활성 모델: %d개\n", images.size(), active_count);
+    std::printf("사용 이미지 수: %zu장 (경로: %s)\n", images.size(), IMG_DIR);
 
-    // ── 전처리 일괄 수행 (latency 측정 대상에서 제외; 모든 모델이 공유) ──
-    // 비동기 writer가 큐를 빠르게 채우려면 전처리가 병목이 되면 안 되므로 미리 처리.
     std::vector<cv::Mat> pre;
     pre.reserve(images.size());
     for (auto& path : images) {
@@ -401,59 +544,56 @@ int main(int argc, char* argv[]) {
         cv::cvtColor(lb, lb, cv::COLOR_BGR2RGB);
         pre.push_back(lb);
     }
-    printf("전처리 완료: %zu장 (메모리 약 %.0f MB)\n\n",
-           pre.size(), pre.size() * 640.0 * 640.0 * 3 / 1e6);
+    std::printf("전처리 완료: %zu장 (약 %.0f MB)\n\n",
+                pre.size(), pre.size() * 640.0 * 640.0 * 3 / 1e6);
 
-    // 측정 시작
+    // ── vstream 생성 (모델별로 한 번에: create_vstreams) ──
+    std::vector<std::pair<std::vector<InputVStream>, std::vector<OutputVStream>>> vstreams_per_ng;
+    for (auto& ng : network_groups) {
+        auto vs_exp = VStreamsBuilder::create_vstreams(*ng, {}, HAILO_FORMAT_TYPE_AUTO);
+        if (!vs_exp) { std::cerr << "vstream 생성 실패, status=" << vs_exp.status() << std::endl; return (int)vs_exp.status(); }
+        vstreams_per_ng.emplace_back(vs_exp.release());
+    }
+
+    // ── 측정 시작 ──
     CpuStats cpu_start = read_cpu_stats();
+    double t_run_start = now_ms();
 
-    double latencies[3] = {-1, -1, -1};
-    int counts[3] = {0, 0, 0};
-    long vol_ctx_arr[3]    = {0, 0, 0};
-    long nonvol_ctx_arr[3] = {0, 0, 0};
-
-    // 모델별로 async_inference 실행 (각자 내부에서 writer/reader 스레드를 띄움)
+    ModelResult results[3];  // index: Detection=0, Segmentation=1, Pose=2 (models 배열과 동일 순서)
     std::vector<std::thread> threads;
-    for (int i = 0; i < 3; i++) {
-        if (!models[i].active) continue;
-        threads.emplace_back(async_inference,
-            network_groups[i], std::ref(pre),
-            models[i].output_count, models[i].name,
-            std::ref(latencies[i]), std::ref(counts[i]),
-            std::ref(vol_ctx_arr[i]), std::ref(nonvol_ctx_arr[i]));
+    for (size_t k = 0; k < vstreams_per_ng.size(); k++) {
+        int mi = active_model_idx[k];
+        threads.emplace_back(run_model_async, models[mi].name,
+            std::ref(vstreams_per_ng[k].first), std::ref(vstreams_per_ng[k].second),
+            std::cref(pre), std::ref(results[mi]));
     }
     for (auto& t : threads) t.join();
 
-    // 측정 종료
+    double run_time_s = (now_ms() - t_run_start) / 1000.0;   // 추론 구간 실측 wall-time(초)
     CpuStats cpu_end = read_cpu_stats();
-
     double final_cpu = calc_cpu_usage(cpu_start, cpu_end);
     double final_mem = read_mem_usage();
-    // 각 추론 스레드가 측정한 context switch를 합산 (워커 스레드는 join 후 사라지므로
-    // 메인 프로세스 status만으로는 추론 부하의 switch를 잡을 수 없음)
+
     long vol_ctx = 0, nonvol_ctx = 0;
-    for (int i = 0; i < 3; i++) {
-        if (!models[i].active) continue;
-        vol_ctx    += vol_ctx_arr[i];
-        nonvol_ctx += nonvol_ctx_arr[i];
-    }
+    for (auto& r : results) { vol_ctx += r.vol_ctx; nonvol_ctx += r.nonvol_ctx; }
 
-    printf("\n========== 실험 결과 ==========\n");
-    printf("Run ID: %d\n", run_id);
-    printf("모델: Det=%d, Seg=%d, Pose=%d\n", USE_DET, USE_SEG, USE_POSE);
-    printf("Priority: Det=%d, Seg=%d, Pose=%d\n\n", PRIORITY_DET, PRIORITY_SEG, PRIORITY_POSE);
-    if (USE_DET)  printf("Detection 평균 Latency: %.2f ms\n", latencies[0]);
-    if (USE_SEG)  printf("Segmentation 평균 Latency: %.2f ms\n", latencies[1]);
-    if (USE_POSE) printf("Pose 평균 Latency: %.2f ms\n", latencies[2]);
-    printf("CPU: %.2f%%, MEM: %.2f%%\n", final_cpu, final_mem);
-    printf("Context Switches - Voluntary: %ld, NonVoluntary: %ld\n", vol_ctx, nonvol_ctx);
-    printf("================================\n");
+    std::printf("\n========== 실험 결과 (Run ID: %d) ==========\n", run_id);
+    if (USE_DET)  std::printf("Detection    : latency=%.2fms, %d장, batch=%d, threshold=%d, timeout=%dms, priority=%d\n",
+                              results[0].avg_latency_ms, results[0].frame_count, BATCH_DET, THRESHOLD_DET, TIMEOUT_DET_MS, PRIORITY_DET);
+    if (USE_SEG)  std::printf("Segmentation : latency=%.2fms, %d장, batch=%d, threshold=%d, timeout=%dms, priority=%d\n",
+                              results[1].avg_latency_ms, results[1].frame_count, BATCH_SEG, THRESHOLD_SEG, TIMEOUT_SEG_MS, PRIORITY_SEG);
+    if (USE_POSE) std::printf("Pose         : latency=%.2fms, %d장, batch=%d, threshold=%d, timeout=%dms, priority=%d\n",
+                              results[2].avg_latency_ms, results[2].frame_count, BATCH_POSE, THRESHOLD_POSE, TIMEOUT_POSE_MS, PRIORITY_POSE);
+    std::printf("CPU: %.2f%%, MEM: %.2f%%, Ctx Switch(vol/nonvol): %ld/%ld\n", final_cpu, final_mem, vol_ctx, nonvol_ctx);
+    std::printf("================================================\n");
+    std::printf("HRTT 트레이스를 PC/WSL에서 `hailo runtime-profiler <파일>.hrtt`로 변환한 뒤,\n"
+                "core_op_set_value 이벤트에서 위 [적용확인] 값과 실제 적용값이 일치하는지 확인할 것.\n");
 
-    save_csv(csv_path, run_id, latencies[0], latencies[1], latencies[2],
-             final_cpu, final_mem, vol_ctx, nonvol_ctx);
+    // ── CSV 저장 (argv[2]로 경로가 주어졌을 때만) ──
+    // 추론 중 측정 가능한 값만 채우고, HRTT/모니터 전용 값은 NaN으로 남긴다.
+    if (!csv_path.empty())
+        save_csv(csv_path, run_id, models, results,
+                 final_cpu, final_mem, vol_ctx, nonvol_ctx, run_time_s);
 
-    for (int i = 0; i < 3; i++)
-        if (models[i].active) hailo_release_hef(hefs[i]);
-    hailo_release_vdevice(vdevice);
-    return 0;
+    return HAILO_SUCCESS;
 }
