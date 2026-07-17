@@ -1,2 +1,0 @@
-batch,threshold,timeout_ms,priority,det_latency_ms,seg_latency_ms,pose_latency_ms,cpu_percent,mem_percent,context_switches,npu_percent
-1,0,0,0,43.3633,49.1514,39.7928,11.5775,13.5922,4327538,67.1668

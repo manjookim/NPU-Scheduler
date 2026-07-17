@@ -1,0 +1,58 @@
+# -*- coding: utf-8 -*-
+"""
+verify_params.py
+HRTT(.hrtt 또는 변환 .html)에서 HailoRT가 '실제로 적용한' 스케줄러 파라미터
+(threshold/timeout/priority)를 core_op_set_value 트레이스로 확인.
+파일명은 전혀 읽지 않음 — 오직 파일 내부의 트레이스 데이터만 근거로 삼는다.
+
+사용법:
+  python3 verify_params.py <파일 또는 폴더> [...]
+  예) python3 verify_params.py hrtt/demo
+"""
+import sys, os, re, glob, base64
+sys.path.insert(0, os.path.dirname(__file__))
+import profiler_pb2
+
+def load(path):
+    if path.endswith(".hrtt"):
+        p = profiler_pb2.ProtoProfiler(); p.ParseFromString(open(path, "rb").read()); return p
+    # html
+    m = re.search(r'PROTOBUF_BASE64_DATA_PLACEHOLDER="([A-Za-z0-9+/=]+)"', open(path, encoding="utf-8").read())
+    if not m: return None
+    p = profiler_pb2.ProtoProfiler(); p.ParseFromString(base64.b64decode(m.group(1))); return p
+
+def lbl(name):
+    n = name.lower()
+    return "pose" if "pose" in n else ("seg" if "seg" in n else "det")
+
+def check(path):
+    p = load(path)
+    if p is None:
+        print(f"  [!] protobuf 없음: {os.path.basename(path)}"); return
+    names = {t.added_core_op.core_op_handle: t.added_core_op.core_op_name
+             for t in p.added_trace if t.WhichOneof("trace") == "added_core_op"}
+    applied = {}  # label -> {threshold,timeout,priority}
+    for t in p.added_trace:
+        if t.WhichOneof("trace") == "core_op_set_value":
+            e = t.core_op_set_value; L = lbl(names.get(e.core_op_handle, ""))
+            applied.setdefault(L, {})
+            for f in ("threshold","timeout","priority"):
+                if e.HasField(f): applied[L][f] = getattr(e, f)
+    print(f"■ {os.path.basename(path)}")
+    for L in ('det','seg','pose'):
+        if L not in applied: continue
+        a = applied[L]
+        thr = a.get('threshold', '(미적용!)'); to = a.get('timeout', '(미적용!)'); pr = a.get('priority', '(미적용!)')
+        print(f"   {L:5} 적용값 threshold={thr}, timeout={to}, priority={pr}")
+
+def main():
+    args = sys.argv[1:] or ["hrtt/demo"]
+    files = []
+    for a in args:
+        if os.path.isdir(a): files += glob.glob(os.path.join(a, "*.hrtt")) + glob.glob(os.path.join(a, "*.html"))
+        else: files.append(a)
+    for f in sorted(files):
+        check(f)
+
+if __name__ == "__main__":
+    main()

@@ -31,3 +31,7 @@ sampled_val2017/
 metrics_prithr.json
 missing_conditions.json
 results_prithr_raw.csv
+
+# 오피스 임시/락 파일
+.~lock.*
+*.tmp

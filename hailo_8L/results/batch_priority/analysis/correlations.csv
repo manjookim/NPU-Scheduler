@@ -1,0 +1,13 @@
+group,pair,corr,n
+batch=1.0,advantage vs total_time,-0.735,405
+batch=1.0,advantage vs latency,-0.715,405
+batch=10.0,advantage vs total_time,-0.783,405
+batch=10.0,advantage vs latency,-0.788,405
+batch=50.0,advantage vs total_time,-0.786,405
+batch=50.0,advantage vs latency,-0.806,405
+batch=63.0,advantage vs total_time,-0.782,405
+batch=63.0,advantage vs latency,-0.806,405
+equal-priority,batch vs det_latency,0.888,72
+equal-priority,batch vs total_time_det,-0.416,72
+equal-priority,batch vs npu,0.44,108
+equal-priority,batch vs fps_det,0.139,72
