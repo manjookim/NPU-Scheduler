@@ -74,6 +74,10 @@
 #include <dirent.h>
 #include <algorithm>
 #include <unistd.h>
+#include <map>
+#include <utility>
+
+#include "postprocess_hailo8.hpp"
 
 using namespace hailort;
 
@@ -113,6 +117,11 @@ using namespace hailort;
 #define USE_DET    1
 #define USE_SEG    1
 #define USE_POSE   1
+
+// [진단용] 1=Pose/Seg 디코딩+NMS 수행(정상), 0=디코딩 스킵(후처리 시간 거의 0으로 고정).
+// 후처리 추가가 backpressure를 통해 latency 자체를 얼마나 밀어올리는지 같은 batch 조건에서
+// A/B 비교하기 위한 스위치. 평소엔 1로 둘 것.
+#define ENABLE_POSTPROCESS  1
 
 // 입력 속도 제한 (모델당 초당 프레임 수). 0 = 제한 없음(최대 속도로 큐를 채움 -> 큐가
 // 항상 포화 상태가 되어 threshold/timeout 효과가 거의 관측되지 않음, findings.md 참고).
@@ -249,8 +258,13 @@ struct ModelResult {
     int frame_count = 0;
     long vol_ctx = 0;
     long nonvol_ctx = 0;
-    double total_time_s = -1;   // 이 모델이 모든 입력(약 670장)을 처리하는 데 걸린 전체 시간(초)
+    double total_time_s = -1;      // 이 모델이 모든 입력(약 670장)을 처리하는 데 걸린 전체 시간(초)
+    double avg_postprocess_ms = -1; // 프레임당 평균 후처리(디코딩+NMS) 시간
+    double avg_total_time_ms = -1;  // 장당 전체 시간 = 전처리(공유, 평균) + latency + 후처리
 };
+
+// 모델 종류 — 어떤 후처리 경로를 태울지 결정 (Detection=on-chip NMS, Seg/Pose=raw tensor CPU 디코딩)
+enum class ModelKind { DET, SEG, POSE };
 
 // 모델별 실행 구성 (main에서 채움). save_csv에서도 참조하므로 전역에 둔다.
 struct ModelConfig {
@@ -261,11 +275,51 @@ struct ModelConfig {
     int timeout_ms;
     int batch;
     bool active;
+    ModelKind kind;
 };
 
+// ========================= 후처리용 output vstream 분류 =========================
+// Pose/Seg의 raw output vstream들은 채널 수(c)만 보면 role을 알 수 있다
+// (box=64, score=1, kpts=51, cls=80, coeff=32, proto=32이지만 h/w=160x160으로 구분).
+// vstream 생성 순서(HEF 선언 순서)에 의존하지 않도록 매 vstream의 get_info().shape로
+// 동적으로 분류한다. [전제] 해당 output vstream은 FLOAT32 + NHWC로 생성되어 있어야 함
+// (postprocess_hailo8.hpp의 TensorView가 그 전제로 버퍼를 인덱싱함).
+enum class OutRole { OTHER, POSE_BOX, POSE_SCORE, POSE_KPTS, SEG_BOX, SEG_CLS, SEG_COEFF, SEG_PROTO };
+
+struct OutMeta {
+    OutRole role = OutRole::OTHER;
+    int h = 0, w = 0, c = 0;
+    int stride = 0;  // img_size / h (정사각 640 입력 가정)
+};
+
+std::vector<OutMeta> classify_outputs(ModelKind kind, std::vector<OutputVStream>& outputs, int img_size = 640) {
+    std::vector<OutMeta> metas(outputs.size());
+    if (kind == ModelKind::DET) return metas;  // Detection은 on-chip NMS 출력이라 분류 불필요
+
+    for (size_t j = 0; j < outputs.size(); j++) {
+        const auto& info = outputs[j].get_info();
+        int h = (int)info.shape.height, w = (int)info.shape.width, c = (int)info.shape.features;
+        metas[j].h = h; metas[j].w = w; metas[j].c = c;
+        metas[j].stride = (h > 0) ? (img_size / h) : 0;
+
+        if (kind == ModelKind::POSE) {
+            if (c == 64) metas[j].role = OutRole::POSE_BOX;
+            else if (c == 1) metas[j].role = OutRole::POSE_SCORE;
+            else if (c == 51) metas[j].role = OutRole::POSE_KPTS;
+        } else if (kind == ModelKind::SEG) {
+            if (c == 64) metas[j].role = OutRole::SEG_BOX;
+            else if (c == 80) metas[j].role = OutRole::SEG_CLS;
+            else if (c == 32) metas[j].role = (h == 160 && w == 160) ? OutRole::SEG_PROTO : OutRole::SEG_COEFF;
+        }
+    }
+    return metas;
+}
+
 void run_model_async(const char* model_name,
+                     ModelKind kind,
                      std::vector<InputVStream>& inputs,
                      std::vector<OutputVStream>& outputs,
+                     const std::vector<OutMeta>& out_meta,
                      const std::vector<cv::Mat>& pre,
                      ModelResult& result)
 {
@@ -315,6 +369,9 @@ void run_model_async(const char* model_name,
         w_vol = c1.voluntary - c0.voluntary; w_nonvol = c1.nonvoluntary - c0.nonvoluntary;
     });
 
+    double pp_total_ms = 0.0;
+    long pp_count = 0;
+
     std::thread reader([&]() {
         CtxSwitches c0 = read_thread_ctx_switches();
         std::vector<std::vector<uint8_t>> obuf(outputs.size());
@@ -331,6 +388,67 @@ void run_model_async(const char* model_name,
                 if (HAILO_SUCCESS != status) { read_status = status; }
             }
             deq_ts[i] = now_ms();  // 이 프레임의 모든 출력을 다 받은 시각
+
+            // ── 후처리 (디코딩 + NMS), 프레임당 소요시간 별도 측정 ──
+            // Detection은 HEF에 on-chip NMS(HailoRT-pp)가 내장되어 있어 이 시점의 obuf가
+            // 이미 최종 검출 결과이므로 추가 디코딩이 필요 없다(후처리시간 ≈ 0으로 기록).
+            double pp_t0 = now_ms();
+#if ENABLE_POSTPROCESS
+            if (kind == ModelKind::POSE) {
+                std::map<std::pair<int,int>, PoseScaleTensors> groups;
+                for (size_t j = 0; j < outputs.size(); j++) {
+                    const auto& m = out_meta[j];
+                    pp::TensorView tv{ reinterpret_cast<const float*>(obuf[j].data()), m.h, m.w, m.c };
+                    auto& g = groups[{m.h, m.w}];
+                    g.stride = m.stride;
+                    if (m.role == OutRole::POSE_BOX) g.box = tv;
+                    else if (m.role == OutRole::POSE_SCORE) g.score = tv;
+                    else if (m.role == OutRole::POSE_KPTS) g.kpts = tv;
+                }
+                std::vector<PoseScaleTensors> scales;
+                scales.reserve(groups.size());
+                for (auto& kv : groups) scales.push_back(kv.second);
+                size_t total_cells = 0;
+                for (auto& sc : scales) total_cells += (size_t)sc.box.h * sc.box.w;
+                size_t raw_cand = 0;
+                // threshold는 조교님 참고 코드 값(conf=0.3, iou=0.45)과 동일하게 맞춤
+                std::vector<PoseDet> pose_dets = decode_pose(scales, 640, 0.3f, 0.45f, 0.5f, &raw_cand);
+                if (i == 0) {
+                    std::lock_guard<std::mutex> lock(print_mutex);
+                    std::printf("  [디버그][%s] 첫 프레임: 그리드 셀 총 %zu개 중 NMS 전 후보=%zu개, 최종 검출=%zu개\n",
+                                model_name, total_cells, raw_cand, pose_dets.size());
+                }
+            } else if (kind == ModelKind::SEG) {
+                std::map<std::pair<int,int>, SegScaleTensors> groups;
+                pp::TensorView proto_tv;
+                for (size_t j = 0; j < outputs.size(); j++) {
+                    const auto& m = out_meta[j];
+                    pp::TensorView tv{ reinterpret_cast<const float*>(obuf[j].data()), m.h, m.w, m.c };
+                    if (m.role == OutRole::SEG_PROTO) { proto_tv = tv; continue; }
+                    auto& g = groups[{m.h, m.w}];
+                    g.stride = m.stride;
+                    if (m.role == OutRole::SEG_BOX) g.box = tv;
+                    else if (m.role == OutRole::SEG_CLS) g.cls = tv;
+                    else if (m.role == OutRole::SEG_COEFF) g.coeff = tv;
+                }
+                std::vector<SegScaleTensors> scales;
+                scales.reserve(groups.size());
+                for (auto& kv : groups) scales.push_back(kv.second);
+                size_t total_cells = 0;
+                for (auto& sc : scales) total_cells += (size_t)sc.box.h * sc.box.w;
+                size_t raw_cand = 0;
+                // threshold는 조교님 참고 코드 값(conf=0.01, iou=0.65)과 동일하게 맞춤
+                std::vector<SegDet> seg_dets = decode_seg(scales, proto_tv, 640, 0.01f, 0.65f, 80, true, &raw_cand);
+                if (i == 0) {
+                    std::lock_guard<std::mutex> lock(print_mutex);
+                    std::printf("  [디버그][%s] 첫 프레임: 그리드 셀 총 %zu개 중 NMS 전 후보=%zu개, 최종 검출=%zu개\n",
+                                model_name, total_cells, raw_cand, seg_dets.size());
+                }
+            }
+#endif  // ENABLE_POSTPROCESS
+            double pp_t1 = now_ms();
+            pp_total_ms += (pp_t1 - pp_t0);
+            pp_count++;
         }
         CtxSwitches c1 = read_thread_ctx_switches();
         r_vol = c1.voluntary - c0.voluntary; r_nonvol = c1.nonvoluntary - c0.nonvoluntary;
@@ -338,6 +456,8 @@ void run_model_async(const char* model_name,
 
     writer.join();
     reader.join();
+
+    result.avg_postprocess_ms = (pp_count > 0) ? (pp_total_ms / pp_count) : -1;
 
     if (HAILO_SUCCESS != write_status || HAILO_SUCCESS != read_status) {
         std::lock_guard<std::mutex> lock(print_mutex);
@@ -364,8 +484,8 @@ void run_model_async(const char* model_name,
     result.total_time_s = (last_deq > first_enq) ? (last_deq - first_enq) / 1000.0 : -1;
 
     std::lock_guard<std::mutex> lock(print_mutex);
-    std::printf("[%s] 완료: 평균 Latency=%.2f ms, %d장, 전체 추론시간=%.2f s (async, INPUT_FPS=%d)\n",
-                model_name, result.avg_latency_ms, result.frame_count, result.total_time_s, INPUT_FPS);
+    std::printf("[%s] 완료: 평균 Latency=%.2f ms, 후처리=%.2f ms, %d장, 전체 추론시간=%.2f s (async, INPUT_FPS=%d)\n",
+                model_name, result.avg_latency_ms, result.avg_postprocess_ms, result.frame_count, result.total_time_s, INPUT_FPS);
 }
 
 // ========================= CSV 저장 =========================
@@ -378,10 +498,11 @@ void run_model_async(const char* model_name,
 // 컬럼 순서 = results/nancheck_rerun/results_nancheck_full.csv 스키마와 완전히 동일.
 //
 // 추론 중 직접 채우는 값:
-//   run_id, use_*, batch, threshold_*, timeout_ms, priority_*   (실행 구성)
+//   run_id, use_*, batch_det/seg/pose, threshold_*, timeout_ms, priority_*   (실행 구성)
 //   det/seg/pose_latency_ms                                     (이 코드가 측정한 end-to-end latency)
 //   cpu_percent, mem_percent, voluntary/nonvoluntary_ctx_switches
 //   run_time_s                                                  (추론 구간 실측 wall-time)
+//   avg_preprocess_ms, postprocess_ms_*, total_time_ms_*        (8L에는 없는 신규 열 — 배치 스윕 실험용)
 static std::string dtos(double v) {           // 음수(-1)=미측정/비활성 → NaN
     if (v < 0) return "NaN";
     std::ostringstream os; os << v; return os.str();
@@ -391,10 +512,11 @@ void save_csv(const std::string& csv_path, int run_id,
               const std::vector<ModelConfig>& models,   // [0]=Det, [1]=Seg, [2]=Pose 고정 순서
               const ModelResult results[3],
               double cpu_percent, double mem_percent,
-              long vol_ctx, long nonvol_ctx, double run_time_s)
+              long vol_ctx, long nonvol_ctx, double run_time_s,
+              double avg_preprocess_ms)
 {
     static const char* HEADER =
-        "run_id,use_det,use_seg,use_pose,batch,"
+        "run_id,use_det,use_seg,use_pose,batch_det,batch_seg,batch_pose,"
         "threshold_det,threshold_seg,threshold_pose,timeout_ms,"
         "priority_det,priority_seg,priority_pose,"
         "det_latency_ms,seg_latency_ms,pose_latency_ms,"
@@ -403,7 +525,10 @@ void save_csv(const std::string& csv_path, int run_id,
         "avg_fps_det,avg_latency_det,max_latency_det,activation_det,"
         "avg_fps_seg,avg_latency_seg,max_latency_seg,activation_seg,"
         "avg_fps_pose,avg_latency_pose,max_latency_pose,activation_pose,"
-        "total_time_det_s,total_time_seg_s,total_time_pose_s";  // 모델별 전체 추론시간(추론 중 실측)
+        "total_time_det_s,total_time_seg_s,total_time_pose_s,"          // 모델별 전체 추론시간(추론 중 실측)
+        "avg_preprocess_ms,"                                             // 장당 평균 전처리시간(공유, 모델 무관 동일값)
+        "postprocess_ms_det,postprocess_ms_seg,postprocess_ms_pose,"     // 장당 평균 후처리(디코딩+NMS)시간
+        "total_time_ms_det,total_time_ms_seg,total_time_ms_pose";        // 장당 전체시간 = 전처리+latency+후처리
 
     // 파일이 없거나 비어 있으면 헤더부터 쓴다.
     bool need_header = true;
@@ -427,13 +552,20 @@ void save_csv(const std::string& csv_path, int run_id,
     double det_tot  = models[0].active ? results[0].total_time_s : -1;
     double seg_tot  = models[1].active ? results[1].total_time_s : -1;
     double pose_tot = models[2].active ? results[2].total_time_s : -1;
+    double det_pp   = models[0].active ? results[0].avg_postprocess_ms : -1;
+    double seg_pp   = models[1].active ? results[1].avg_postprocess_ms : -1;
+    double pose_pp  = models[2].active ? results[2].avg_postprocess_ms : -1;
+    double det_ttl  = models[0].active ? results[0].avg_total_time_ms : -1;
+    double seg_ttl  = models[1].active ? results[1].avg_total_time_ms : -1;
+    double pose_ttl = models[2].active ? results[2].avg_total_time_ms : -1;
 
     std::ostringstream row;
     row << run_id << ','
         << (models[0].active ? 1 : 0) << ','
         << (models[1].active ? 1 : 0) << ','
         << (models[2].active ? 1 : 0) << ','
-        << models[0].batch << ','                                  // batch (모델 통일값)
+        // batch는 8L과 달리 모델별로 다른 값을 쓸 수 있어(배치사이즈 스윕 실험) 3열로 분리 기록.
+        << models[0].batch << ',' << models[1].batch << ',' << models[2].batch << ','
         << models[0].threshold << ',' << models[1].threshold << ',' << models[2].threshold << ','
         << models[0].timeout_ms << ','                             // timeout_ms (실험에서 모델 통일)
         << models[0].priority << ',' << models[1].priority << ',' << models[2].priority << ','
@@ -449,7 +581,10 @@ void save_csv(const std::string& csv_path, int run_id,
         << "NaN,NaN,NaN,NaN,"                                      // seg
         << "NaN,NaN,NaN,NaN,"                                      // pose
         // ↓ 모델별 전체 추론시간 (추론 중 실측, 비활성=NaN)
-        << dtos(det_tot) << ',' << dtos(seg_tot) << ',' << dtos(pose_tot);
+        << dtos(det_tot) << ',' << dtos(seg_tot) << ',' << dtos(pose_tot) << ','
+        << dtos(avg_preprocess_ms) << ','
+        << dtos(det_pp) << ',' << dtos(seg_pp) << ',' << dtos(pose_pp) << ','
+        << dtos(det_ttl) << ',' << dtos(seg_ttl) << ',' << dtos(pose_ttl);
     f << row.str() << "\n";
     f.close();
 
@@ -481,9 +616,9 @@ int main(int argc, char* argv[])
     std::cout << "VDevice 생성 성공!" << std::endl;
 
     std::vector<ModelConfig> models = {
-        {DET_HEF,  "Detection",    PRIORITY_DET,  THRESHOLD_DET,  TIMEOUT_DET_MS,  BATCH_DET,  (bool)USE_DET},
-        {SEG_HEF,  "Segmentation", PRIORITY_SEG,  THRESHOLD_SEG,  TIMEOUT_SEG_MS,  BATCH_SEG,  (bool)USE_SEG},
-        {POSE_HEF, "Pose",         PRIORITY_POSE, THRESHOLD_POSE, TIMEOUT_POSE_MS, BATCH_POSE, (bool)USE_POSE},
+        {DET_HEF,  "Detection",    PRIORITY_DET,  THRESHOLD_DET,  TIMEOUT_DET_MS,  BATCH_DET,  (bool)USE_DET,  ModelKind::DET},
+        {SEG_HEF,  "Segmentation", PRIORITY_SEG,  THRESHOLD_SEG,  TIMEOUT_SEG_MS,  BATCH_SEG,  (bool)USE_SEG,  ModelKind::SEG},
+        {POSE_HEF, "Pose",         PRIORITY_POSE, THRESHOLD_POSE, TIMEOUT_POSE_MS, BATCH_POSE, (bool)USE_POSE, ModelKind::POSE},
     };
 
     std::vector<std::shared_ptr<ConfiguredNetworkGroup>> network_groups;
@@ -549,6 +684,7 @@ int main(int argc, char* argv[])
         images.resize(NUM_IMAGES);
     std::printf("사용 이미지 수: %zu장 (경로: %s)\n", images.size(), IMG_DIR);
 
+    double t_prep_start = now_ms();
     std::vector<cv::Mat> pre;
     pre.reserve(images.size());
     for (auto& path : images) {
@@ -558,8 +694,12 @@ int main(int argc, char* argv[])
         cv::cvtColor(lb, lb, cv::COLOR_BGR2RGB);
         pre.push_back(lb);
     }
-    std::printf("전처리 완료: %zu장 (약 %.0f MB)\n\n",
-                pre.size(), pre.size() * 640.0 * 640.0 * 3 / 1e6);
+    double t_prep_end = now_ms();
+    // 장당 평균 전처리시간 — 모든 모델이 동일한 letterbox 전처리를 공유하므로 모델별로
+    // 따로 재지 않고, 전체 전처리 구간을 이미지 수로 나눈 평균값을 공통으로 사용한다.
+    double avg_preprocess_ms = pre.empty() ? 0.0 : (t_prep_end - t_prep_start) / pre.size();
+    std::printf("전처리 완료: %zu장 (약 %.0f MB), 장당 평균 전처리시간=%.3f ms\n\n",
+                pre.size(), pre.size() * 640.0 * 640.0 * 3 / 1e6, avg_preprocess_ms);
 
     // ── vstream 생성 (입력/출력 timeout을 크게 잡음) ──
     // [중요] vstream 기본 timeout은 10초다. 우선순위가 낮은 모델은 높은 모델이 끝날 때까지
@@ -568,20 +708,36 @@ int main(int argc, char* argv[])
     // (공식 API: ConfiguredNetworkGroup::make_input/output_vstream_params + create_input/output_vstreams)
     const uint32_t VSTREAM_TIMEOUT_MS = 300000;  // 5분 — starvation 대기 여유
     std::vector<std::pair<std::vector<InputVStream>, std::vector<OutputVStream>>> vstreams_per_ng;
-    for (auto& ng : network_groups) {
+    std::vector<std::vector<OutMeta>> out_meta_per_ng;  // vstreams_per_ng와 동일 인덱스로 정렬
+    for (size_t k = 0; k < network_groups.size(); k++) {
+        auto& ng = network_groups[k];
+        ModelKind kind = models[active_model_idx[k]].kind;
+
         auto in_params  = ng->make_input_vstream_params(false, HAILO_FORMAT_TYPE_AUTO,
                               VSTREAM_TIMEOUT_MS, HAILO_DEFAULT_VSTREAM_QUEUE_SIZE);
-        auto out_params = ng->make_output_vstream_params(false, HAILO_FORMAT_TYPE_AUTO,
+        // Detection: on-chip NMS 출력이라 AUTO 유지(기존 검증된 그대로).
+        // Segmentation/Pose: raw tensor라서 후처리(DFL 디코딩) 대상 — FLOAT32로 명시 요청해
+        // HailoRT가 qp_scale/qp_zp 역양자화까지 대신 하게 하고, order도 NHWC로 고정한다
+        // (parse-hef가 일부 출력을 FCR로 표시했으므로 AUTO에 맡기지 않음).
+        hailo_format_type_t out_fmt_type = (kind == ModelKind::DET) ? HAILO_FORMAT_TYPE_AUTO : HAILO_FORMAT_TYPE_FLOAT32;
+        auto out_params = ng->make_output_vstream_params(false, out_fmt_type,
                               VSTREAM_TIMEOUT_MS, HAILO_DEFAULT_VSTREAM_QUEUE_SIZE);
         if (!in_params)  { std::cerr << "input vstream params 실패, status="  << in_params.status()  << std::endl; return (int)in_params.status(); }
         if (!out_params) { std::cerr << "output vstream params 실패, status=" << out_params.status() << std::endl; return (int)out_params.status(); }
+
+        if (kind != ModelKind::DET) {
+            for (auto& kv : out_params.value())
+                kv.second.user_buffer_format.order = HAILO_FORMAT_ORDER_NHWC;
+        }
 
         auto in_vs  = ng->create_input_vstreams(in_params.value());
         auto out_vs = ng->create_output_vstreams(out_params.value());
         if (!in_vs)  { std::cerr << "input vstream 생성 실패, status="  << in_vs.status()  << std::endl; return (int)in_vs.status(); }
         if (!out_vs) { std::cerr << "output vstream 생성 실패, status=" << out_vs.status() << std::endl; return (int)out_vs.status(); }
 
-        vstreams_per_ng.emplace_back(std::make_pair(in_vs.release(), out_vs.release()));
+        auto out_vs_val = out_vs.release();
+        out_meta_per_ng.push_back(classify_outputs(kind, out_vs_val));
+        vstreams_per_ng.emplace_back(std::make_pair(in_vs.release(), std::move(out_vs_val)));
     }
 
     // ── 측정 시작 ──
@@ -592,11 +748,20 @@ int main(int argc, char* argv[])
     std::vector<std::thread> threads;
     for (size_t k = 0; k < vstreams_per_ng.size(); k++) {
         int mi = active_model_idx[k];
-        threads.emplace_back(run_model_async, models[mi].name,
+        threads.emplace_back(run_model_async, models[mi].name, models[mi].kind,
             std::ref(vstreams_per_ng[k].first), std::ref(vstreams_per_ng[k].second),
+            std::cref(out_meta_per_ng[k]),
             std::cref(pre), std::ref(results[mi]));
     }
     for (auto& t : threads) t.join();
+
+    // 장당 전체시간(전처리-추론-후처리) = 공유 평균 전처리시간 + 모델별 평균 latency + 모델별 평균 후처리시간
+    for (int i = 0; i < 3; i++) {
+        if (models[i].active && results[i].avg_latency_ms >= 0) {
+            double pp = (results[i].avg_postprocess_ms >= 0) ? results[i].avg_postprocess_ms : 0.0;
+            results[i].avg_total_time_ms = avg_preprocess_ms + results[i].avg_latency_ms + pp;
+        }
+    }
 
     double run_time_s = (now_ms() - t_run_start) / 1000.0;   // 추론 구간 실측 wall-time(초)
     CpuStats cpu_end = read_cpu_stats();
@@ -607,12 +772,16 @@ int main(int argc, char* argv[])
     for (auto& r : results) { vol_ctx += r.vol_ctx; nonvol_ctx += r.nonvol_ctx; }
 
     std::printf("\n========== 실험 결과 (Run ID: %d) ==========\n", run_id);
-    if (USE_DET)  std::printf("Detection    : latency=%.2fms, %d장, batch=%d, threshold=%d, timeout=%dms, priority=%d\n",
-                              results[0].avg_latency_ms, results[0].frame_count, BATCH_DET, THRESHOLD_DET, TIMEOUT_DET_MS, PRIORITY_DET);
-    if (USE_SEG)  std::printf("Segmentation : latency=%.2fms, %d장, batch=%d, threshold=%d, timeout=%dms, priority=%d\n",
-                              results[1].avg_latency_ms, results[1].frame_count, BATCH_SEG, THRESHOLD_SEG, TIMEOUT_SEG_MS, PRIORITY_SEG);
-    if (USE_POSE) std::printf("Pose         : latency=%.2fms, %d장, batch=%d, threshold=%d, timeout=%dms, priority=%d\n",
-                              results[2].avg_latency_ms, results[2].frame_count, BATCH_POSE, THRESHOLD_POSE, TIMEOUT_POSE_MS, PRIORITY_POSE);
+    std::printf("장당 평균 전처리시간(공유): %.3f ms\n", avg_preprocess_ms);
+    if (USE_DET)  std::printf("Detection    : latency=%.2fms, 후처리=%.2fms, 전체=%.2fms, %d장, batch=%d, threshold=%d, timeout=%dms, priority=%d\n",
+                              results[0].avg_latency_ms, results[0].avg_postprocess_ms, results[0].avg_total_time_ms,
+                              results[0].frame_count, BATCH_DET, THRESHOLD_DET, TIMEOUT_DET_MS, PRIORITY_DET);
+    if (USE_SEG)  std::printf("Segmentation : latency=%.2fms, 후처리=%.2fms, 전체=%.2fms, %d장, batch=%d, threshold=%d, timeout=%dms, priority=%d\n",
+                              results[1].avg_latency_ms, results[1].avg_postprocess_ms, results[1].avg_total_time_ms,
+                              results[1].frame_count, BATCH_SEG, THRESHOLD_SEG, TIMEOUT_SEG_MS, PRIORITY_SEG);
+    if (USE_POSE) std::printf("Pose         : latency=%.2fms, 후처리=%.2fms, 전체=%.2fms, %d장, batch=%d, threshold=%d, timeout=%dms, priority=%d\n",
+                              results[2].avg_latency_ms, results[2].avg_postprocess_ms, results[2].avg_total_time_ms,
+                              results[2].frame_count, BATCH_POSE, THRESHOLD_POSE, TIMEOUT_POSE_MS, PRIORITY_POSE);
     std::printf("CPU: %.2f%%, MEM: %.2f%%, Ctx Switch(vol/nonvol): %ld/%ld\n", final_cpu, final_mem, vol_ctx, nonvol_ctx);
     std::printf("================================================\n");
     std::printf("HRTT 트레이스를 PC/WSL에서 `hailo runtime-profiler <파일>.hrtt`로 변환한 뒤,\n"
@@ -622,7 +791,7 @@ int main(int argc, char* argv[])
     // 추론 중 측정 가능한 값만 채우고, HRTT/모니터 전용 값은 NaN으로 남긴다.
     if (!csv_path.empty())
         save_csv(csv_path, run_id, models, results,
-                 final_cpu, final_mem, vol_ctx, nonvol_ctx, run_time_s);
+                 final_cpu, final_mem, vol_ctx, nonvol_ctx, run_time_s, avg_preprocess_ms);
 
     return HAILO_SUCCESS;
 }
