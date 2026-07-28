@@ -25,6 +25,13 @@ request.txt
 *.zip
 sampled_val2017/
 
+# 배치스윕/priority 실험 원본 트레이스(.hrtt)·변환 리포트(.html) — 용량 큼(수백MB~GB), git 제외.
+# csv/xlsx 결과 요약본만 추적한다.
+hailo_8/experiments/traces/
+hailo_8/experiments/html/
+hailo_8L/experiments/*/traces/
+hailo_8L/experiments/*/html/
+
 # 백업/중간 산출물 (재생성 가능, git 제외)
 *.bak.csv
 *.prenancheck.csv

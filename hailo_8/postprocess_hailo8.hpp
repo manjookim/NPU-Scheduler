@@ -21,13 +21,16 @@
  * 동일함을 대조 확인해 그대로 유지함.
  *
  * [중요 — infer_scheduler_hailo8.cpp의 vstream 생성부와 반드시 짝이 맞아야 함]
- * Pose/Segmentation output vstream은
+ * Detection/Pose/Segmentation 세 모델 모두 output vstream을
  *   - format type  = HAILO_FORMAT_TYPE_FLOAT32  (HailoRT가 qp_scale/qp_zp로
- *     역양자화까지 대신 해줌 → 이 헤더는 역양자화를 하지 않고 float를 그대로 읽음)
- *   - format order = HAILO_FORMAT_ORDER_NHWC     (parse-hef가 일부 출력을 FCR로
- *     표시했으므로 AUTO에 맡기지 않고 명시적으로 NHWC 고정)
- * 로 생성되어 있어야 아래 TensorView가 버퍼를 올바르게 인덱싱한다.
- * (Detection은 on-chip NMS(HailoRT-pp) 출력이라 이 헤더를 거치지 않음.)
+ *     역양자화까지 대신 해줌 → 이 헤더는 역양자화를 하지 않고 float를 그대로 읽음.
+ *     조교님 참고 파이썬 코드도 세 모델 전부 FLOAT32로 받음)
+ *   - Pose/Seg만 format order = HAILO_FORMAT_ORDER_NHWC 로 추가 고정
+ *     (parse-hef가 일부 출력을 FCR로 표시했으므로 AUTO에 맡기지 않음.
+ *      Detection은 NMS-by-class 출력이라 order 지정 대상이 아님)
+ * 로 생성되어 있어야 아래 TensorView/decode_det이 버퍼를 올바르게 인덱싱한다.
+ * (Detection은 on-chip NMS(HailoRT-pp)라 디코딩/NMS는 안 하지만, NMS 결과 버퍼를
+ *  구조화된 리스트로 "파싱"하는 decode_det()는 이 파일에 있음 — 아래 참고.)
  *
  * 이 파일은 "정확한 mAP 재현"이 목적이 아니라, 스케줄러 벤치마크에 필요한
  * "장당 전체 추론시간(전처리-추론-후처리)"을 재는 데 필요한 실제 디코딩+NMS
@@ -152,6 +155,95 @@ inline PPBox decode_dfl_box(const float* box_raw /* [4][reg_len+1] flattened row
 }
 
 } // namespace pp
+
+// ========================= YOLOv8-Detection 후처리 (on-chip NMS 결과 파싱) =========================
+// [2026-07-26 추가] Detection은 HEF에 NMS가 이미 내장돼 있어(HailoRT-pp) 디코딩/NMS 연산
+// 자체는 필요 없다. 다만 결과가 HAILO_NMS_BY_CLASS 포맷의 raw byte 버퍼로 나오므로,
+// 이걸 구조화된 검출 리스트(PPBox)로 "파싱"하는 작업은 CPU에서 해야 하고, 이 파싱 비용을
+// Detection의 "후처리(postprocess)"로 측정한다.
+//
+// 버퍼 레이아웃(HailoRT hailort_common.hpp의 get_nms_by_class_host_shape_size 계산 방식 기준,
+// output vstream을 FLOAT32로 받았을 때):
+//   클래스마다 고정 크기 청크가 순서대로 이어짐:
+//     [count(1개, float로 인코딩된 실제 검출 개수),
+//      (y_min, x_min, y_max, x_max, score) x max_bboxes_per_class]
+//   count는 실제 검출 개수(<= max_bboxes_per_class)이고 그 뒤 미사용 슬롯은 don't-care.
+//   number_of_classes / max_bboxes_per_class는 output vstream의 get_info().nms_shape에서
+//   얻는다(HailoRTCommon::is_nms()가 true인 NMS 포맷 vstream 전용 필드 — get_frame_size()
+//   내부에서도 이 필드를 그대로 사용하므로 소스상 근거는 확실하나, 실기에서 파싱 결과가
+//   말이 되는지(클래스 수/개수/좌표 범위) 첫 프레임 디버그 출력으로 반드시 확인할 것).
+
+// letterbox 전처리 메타데이터(원본 이미지 -> 640 패딩 좌표로의 변환 정보).
+// infer_scheduler_hailo8.cpp의 letterbox()가 전처리 시점에 채워서 프레임별로 들고 있다가,
+// Detection 후처리에서 좌표 unpad(패딩 제거 + 스케일 역보정)에 쓴다.
+struct LetterboxMeta {
+    float scale = 1.0f;      // 원본 -> 리사이즈 배율 (min(target/h, target/w))
+    int pad_top = 0, pad_left = 0;
+    int orig_w = 0, orig_h = 0;
+};
+
+// COCO category_id 매핑: YOLO 0~79 contiguous class idx -> COCO 공식 category_id(1~90,
+// non-contiguous, 표준 COCO80->91 매핑표). Ultralytics coco80_to_coco91_class()와 동일한
+// 값으로, 사실상 업계 표준이라 어디서나 같은 배열이 쓰인다. [주의] 조교님 참고 코드의
+// coco_ids 리스트와 값이 정확히 일치하는지 한 번은 대조해볼 것(직접 대조는 못 했음).
+inline int coco_category_id(int yolo_class_id) {
+    static const int coco_ids[80] = {
+        1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,18,19,20,21,
+        22,23,24,25,27,28,31,32,33,34,35,36,37,38,39,40,41,42,43,44,
+        46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,
+        67,70,72,73,74,75,76,77,78,79,80,81,82,84,85,86,87,88,89,90
+    };
+    if (yolo_class_id < 0 || yolo_class_id >= 80) return yolo_class_id;
+    return coco_ids[yolo_class_id];
+}
+
+// meta == nullptr 이면 기존과 동일하게 640 기준 정규화 좌표 + YOLO class_id 그대로 반환.
+// meta != nullptr 이면 원본 이미지 픽셀 좌표로 unpad하고 class_id를 COCO category_id로
+// 매핑해서 반환(조교님 YOLOv8DetDecoder.decode()와 동일한 두 단계).
+inline std::vector<PPBox> decode_det(const float* data, int number_of_classes, int max_bboxes_per_class,
+                                      float score_thr = 0.0f,   // on-chip NMS가 이미 자체 threshold로 걸러서 나오므로 기본은 다 통과
+                                      const LetterboxMeta* meta = nullptr,
+                                      int model_input_size = 640)
+{
+    std::vector<PPBox> dets;
+    if (!data || number_of_classes <= 0 || max_bboxes_per_class <= 0) return dets;
+
+    const size_t stride = 1 + 5 * (size_t)max_bboxes_per_class;  // 클래스 1개 청크의 float 개수
+    for (int cls = 0; cls < number_of_classes; cls++) {
+        size_t base = (size_t)cls * stride;
+        int count = (int)(data[base] + 0.5f);  // float로 인코딩된 개수 -> 반올림
+        if (count < 0) count = 0;
+        if (count > max_bboxes_per_class) count = max_bboxes_per_class;  // 방어적 클램프(버퍼 초과 접근 방지)
+        for (int i = 0; i < count; i++) {
+            size_t o = base + 1 + (size_t)i * 5;
+            float ymin = data[o + 0], xmin = data[o + 1], ymax = data[o + 2], xmax = data[o + 3], score = data[o + 4];
+            if (score < score_thr) continue;
+
+            PPBox box;
+            if (meta && meta->scale > 1e-9f) {
+                // 정규화(0~1, 640 기준) -> 640 픽셀 -> 패딩 제거 -> 스케일 역보정 -> 원본 이미지 픽셀
+                float x1_640 = xmin * model_input_size, y1_640 = ymin * model_input_size;
+                float x2_640 = xmax * model_input_size, y2_640 = ymax * model_input_size;
+                box.x1 = (x1_640 - meta->pad_left) / meta->scale;
+                box.y1 = (y1_640 - meta->pad_top)  / meta->scale;
+                box.x2 = (x2_640 - meta->pad_left) / meta->scale;
+                box.y2 = (y2_640 - meta->pad_top)  / meta->scale;
+                // 패딩 영역에 걸친 박스가 원본 경계를 벗어날 수 있어 클램프
+                box.x1 = std::max(0.f, std::min(box.x1, (float)meta->orig_w));
+                box.y1 = std::max(0.f, std::min(box.y1, (float)meta->orig_h));
+                box.x2 = std::max(0.f, std::min(box.x2, (float)meta->orig_w));
+                box.y2 = std::max(0.f, std::min(box.y2, (float)meta->orig_h));
+                box.class_id = coco_category_id(cls);
+            } else {
+                box.x1 = xmin; box.y1 = ymin; box.x2 = xmax; box.y2 = ymax;
+                box.class_id = cls;
+            }
+            box.score = score;
+            dets.push_back(box);
+        }
+    }
+    return dets;
+}
 
 // ========================= YOLOv8-Pose 후처리 =========================
 // 입력: 3개 스케일(stride 8/16/32) 각각 box(64=4x16 DFL), score(1), kpts(51=17x3) 텐서.
