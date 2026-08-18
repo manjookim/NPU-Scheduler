@@ -30,7 +30,10 @@ inline void run_model_async(const char* model_name,
                      const std::vector<std::string>& images,  // [2026-07-28] 파일 경로만 공유. 전처리(imread+letterbox)는
                                                                // 더이상 미리 한꺼번에 하지 않고 writer 스레드 루프 안에서
                                                                // 프레임마다 수행한다(조교님 요청: "1장씩 전처리-추론-후처리").
-                     ModelResult& result)
+                     ModelResult& result,
+                     int img_size = 640)  // [2026-08-06 추가] YOLOv5 nms_core(512x512) 등 640이 아닌
+                                           // 입력 크기를 쓰는 모델 지원용. 기본값 640이라 기존 호출부는
+                                           // 인자를 안 줘도 그대로 640으로 동작(하위 호환).
 {
     if (inputs.empty() || outputs.empty()) {
         std::lock_guard<std::mutex> lock(print_mutex);
@@ -69,10 +72,10 @@ inline void run_model_async(const char* model_name,
                 std::lock_guard<std::mutex> lock(print_mutex);
                 std::cerr << "[" << model_name << "] [경고] 이미지 로드 실패: " << images[i]
                            << " (검은 화면으로 대체, 프레임 수/인덱스 정렬 유지)" << std::endl;
-                lb = cv::Mat::zeros(640, 640, CV_8UC3);
+                lb = cv::Mat::zeros(img_size, img_size, CV_8UC3);
             } else {
                 LetterboxMeta lm;
-                lb = letterbox(img, 640, &lm);
+                lb = letterbox(img, img_size, &lm);
                 cv::cvtColor(lb, lb, cv::COLOR_BGR2RGB);
                 pre_meta[i] = lm;
             }
@@ -134,7 +137,7 @@ inline void run_model_async(const char* model_name,
                     std::vector<PPBox> det_dets = decode_det(reinterpret_cast<const float*>(obuf[0].data()),
                                                               out_meta[0].nms_number_of_classes,
                                                               out_meta[0].nms_max_bboxes_per_class,
-                                                              0.0f, lm);
+                                                              0.0f, lm, img_size);
                     if (i == 0) {
                         std::lock_guard<std::mutex> lock(print_mutex);
                         std::printf("  [디버그][%s] 첫 프레임: 클래스 %d개 x 클래스당 최대 %d개 파싱, 검출=%zu개",

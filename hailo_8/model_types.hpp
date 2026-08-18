@@ -18,6 +18,10 @@ struct ModelConfig {
     int batch;
     bool active;
     ModelKind kind;
+    // [2026-08-06 추가] YOLOv5 nms_core HEF(512x512 입력)처럼 640이 아닌 모델을 같은 코드로
+    // 돌리기 위한 필드. 기본값 640이라 기존 3모델(Det/Seg/Pose, 전부 640 입력) 초기화 리스트는
+    // 이 필드를 생략해도 그대로 640으로 채워져 동작이 바뀌지 않는다(aggregate init 기본값).
+    int img_size = 640;
 };
 
 // 모델 1개(writer/reader 스레드 쌍)의 측정 결과.

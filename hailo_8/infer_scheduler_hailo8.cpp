@@ -245,7 +245,7 @@ int main(int argc, char* argv[])
         threads.emplace_back(run_model_async, models[mi].name, models[mi].kind,
             std::ref(vstreams_per_ng[k].first), std::ref(vstreams_per_ng[k].second),
             std::cref(out_meta_per_ng[k]),
-            std::cref(images), std::ref(results[mi]));
+            std::cref(images), std::ref(results[mi]), models[mi].img_size);
     }
     for (auto& t : threads) t.join();
 

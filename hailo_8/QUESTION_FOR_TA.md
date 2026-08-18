@@ -66,3 +66,21 @@ Hailo 공식 커뮤니티에서 동일한 증상이 이미 보고되어 있었�
 - OS: Debian GNU/Linux 13 (trixie), 커널 6.12.47+rpt-rpi-2712
 - HailoRT / hailort-pcie-driver: 4.23.0
 - 참고: 8L 보드(rpi1)는 Ubuntu 24.04.4 LTS, 커널 6.8.0-1056-raspi, HailoRT 4.23.0 (동일 버전)
+
+## [2026-08-07 추가] 재발 — 이번엔 디바이스가 완전히 죽진 않음
+
+`infer_scheduler_hailo8_v5det`(Detection=YOLOv5 nms_core HEF, 3모델 동시 실행) 실험 중
+`run_id=1`은 정상 완료됐는데, `run_id=2` 시작 시점에 동일한 트레이스로 재발함
+(`find_vma+0x6c/0x80` → `hailo_vdma_buffer_map` → `hailo_vdma_buffer_map_ioctl` →
+`hailo_pcie_fops_unlockedioctl`, `WARNING: ... at include/linux/rwsem.h:80 find_vma+0x6c/0x80`,
+`Tainted: G W O`). 모델 종류(YOLOv5 nms_core 포함)나 개수와 무관하게 터진다는 기존 판단과
+일치함.
+
+**차이점**: 이번엔 크래시 직후 `hailortcli fw-control identify`가 정상 응답함
+(Firmware 4.23.0, Architecture HAILO8 그대로 확인) — 재부팅 없이 디바이스가 살아있는
+상태로 유지됨. 예전 기록("완전히 응답 불가 상태가 되어 재부팅해야만 복구")과 다르게
+이번엔 WARN만 찍히고 하드 크래시까지는 안 간 케이스. 재시도 시 프로세스 재실행만으로
+넘어갈 수 있었음(재부팅 불필요). 다만 07-26 배치스윕 실험 등은 이 사이에 문제없이
+완료된 이력이 있어, 이 버그가 상시 재현되는 게 아니라 간헐적으로(비결정적으로) 터지는
+것으로 보임 — 자동화 스크립트에 "실패 시 자동 재시도" 로직을 넣는 게 실용적일지도
+질문 3번과 함께 여쭤보고 싶음.
