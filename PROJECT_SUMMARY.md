@@ -1,7 +1,7 @@
 # NPU Scheduler 실험 프로젝트 — 전체 요약 (AI 인수인계용)
 
 이 문서는 다른 기기(스마트폰 등)에서 다른 AI가 이 프로젝트를 이어서 도와줄 때
-빠르게 맥락을 파악할 수 있도록 정리한 문서입니다. 최종 갱신: 2026-08-08.
+빠르게 맥락을 파악할 수 있도록 정리한 문서입니다. 최종 갱신: 2026-08-19.
 
 ---
 
@@ -354,6 +354,115 @@ CSV 두 개를:
 4. rpi4에서 `source ~/hailo_platform_venv/bin/activate && python3 hailo_utilization_hailo8.py`
    수동 실행해서 npu_percent 폴링이 왜 안 되는지 직접 에러 확인(지금은 hrtt 기반 대체값으로
    우회했지만 근본 원인은 안 고쳐짐).
+
+---
+
+## 7-2. [2026-08-19] Det 단일모델 v8s(CPU 후처리) vs v5-nms_core(NPU 후처리) FPS=60 실험 준비
+
+사용자 요청: Det 모델만 대상으로 HEF 2종(`yolov8s.hef`=CPU 후처리, `yolov5xs_wo_spp_nms_core.hef`
+=NPU 후처리)을 비교. **단일 모델 추론만**(Seg/Pose 없음), 조건당 3회 반복 후 평균, 측정 항목은
+전체 추론시간 + 전처리/추론/후처리 각각의 시간. 후처리 담당 프로세서(NPU/CPU)와 그로 인해
+불가피하게 달라지는 모델 버전(v8s/v5, img_size 640/512) 외에는 전부 동일 환경, **INPUT_FPS=60**
+기준으로 통일해서 돌리고 싶다는 요청.
+
+(참고: 리포 루트의 `results_singlemodel_fps5to25.xlsx`(오늘 날짜로 갱신된 최신 파일)를 보면
+직전에는 Hailo-8L(rpi1)에서 `infer_scheduler.cpp` 기반 단일모델 프레임워크로 Det/Seg/Pose 각각
+단독을 INPUT_FPS={5,10,15,20,25}로 스윕한 실험을 진행했었음 — 이번 요청은 그 다음 단계로,
+Hailo-8(rpi4) 쪽에서 이미 준비돼 있던 v5det NPU-후처리 비교 코드를 Det 단독 케이스로 좁혀
+FPS=60에서 재실행하는 것.)
+
+**이미 존재하던 코드로 대부분 해결됨**: `hailo_8/infer_yolov5_hailo8.cpp`가 2026-08-06에 이미
+`USE_CPU_BASELINE_INSTEAD` 매크로로 정확히 이 비교(0=YOLOv5 NPU 후처리, 1=YOLOv8s CPU 후처리)를
+할 수 있도록 만들어져 있었음(Det 단독, chrono 타이머로 전처리/추론(latency)/후처리/전체시간을
+직접 측정해 1행 CSV로 저장) — 실기 실행만 한 번도 안 된 상태였음.
+
+**이번에 추가/수정한 것**:
+1. `hailo_8/infer_yolov5_hailo8.cpp`: `INPUT_FPS` 기본값 `0`(무제한) → `60`으로 변경(주석도
+   갱신). 로직 변경 없음 — 모델 1개 단독이라 스케줄링 경합 자체는 없지만, "동일 환경" 정의를
+   맞추기 위해 입력 속도를 두 조건 다 60fps로 통제.
+2. `hailo_8/scripts/run_det_v8s_vs_v5npu_fps60.sh` (신규): `USE_CPU_BASELINE_INSTEAD`와
+   `INPUT_FPS`를 sed로 토글해가며 v5(NPU)/v8s(CPU) 두 조건을 각각 3회씩 자동 빌드·실행(총
+   6회), 같은 CSV에 순차 저장(run_id 1~3=v5 NPU, 4~6=v8s CPU). `yolov5xs_wo_spp_nms_core.hef`가
+   없으면 공식 hailo_model_zoo S3에서 자동 다운로드. HAILORT_INCLUDE `-I` 플래그 포함(rpi4
+   경로 이슈, §4 참고). hailo_pci 드라이버의 간헐적 크래시(QUESTION_FOR_TA.md)에 대비해 실행
+   직후 CSV 행 수 증가를 확인하고 안 늘면 자동 재시도(최대 5회)하는 로직 포함. 결과 경로:
+   `hailo_8/experiments/{실행일}_det_v8s_vs_v5npu_fps60_exp1/csv/results_det_v8s_vs_v5npu_fps60.csv`.
+3. `hailo_8/scripts/make_avg_csv_det_v8s_vs_v5npu.py` (신규): 6행 raw CSV를 `hef_name` 기준
+   2그룹(v5-NPU/v8s-CPU)으로 묶어 3회 평균 낸 `_avg.csv` 생성(`hailo_8L/scripts/make_avg_csv.py`
+   와 동일 패턴, 그룹핑 키만 단일 모델용으로 단순화). 위 스크립트가 실행 끝에 자동 호출함.
+4. `hailo_8/scripts/build_xlsx_det_v8s_vs_v5npu.py` (신규): raw CSV + avg CSV를 컬럼설명/
+   전체(6행)/조건별_3회평균(2행) 3개 시트짜리 xlsx로 합침(`results_singlemodel_fps5to25.xlsx`와
+   동일한 시트 구성 관례). RPi가 아니라 결과를 scp로 받은 뒤 PC(또는 openpyxl 있는 아무 환경)
+   에서 실행하는 용도. 더미 데이터로 동작 검증 완료(3개 스크립트 모두 문법/실행 테스트 통과).
+
+**아직 안 된 것 — 실기 실행 필요**: 샌드박스는 RPi(rpi4) SSH 접근 권한이 없어 직접 실행 불가.
+사용자가 `hailo_8/infer_yolov5_hailo8.cpp` + `hailo_8/scripts/run_det_v8s_vs_v5npu_fps60.sh` +
+`hailo_8/scripts/make_avg_csv_det_v8s_vs_v5npu.py`(+ 필요시 `postprocess_hailo8.hpp`,
+`model_types.hpp` 등 기존 헤더들 — 이미 rpi4에 있을 가능성 높음, 없으면 같이 scp)를 rpi4에
+scp한 뒤 `./run_det_v8s_vs_v5npu_fps60.sh` 직접 실행해야 함. 결과 CSV를 PC로 받아온 뒤
+`build_xlsx_det_v8s_vs_v5npu.py`로 최종 xlsx까지 만들 수 있음(원하면 다음 세션에서 CSV를
+주면 바로 만들어 줄 수 있음).
+
+---
+
+## 7-3. [2026-08-19, 같은 세션 내 정정] "Hailo-8은 안 함, 앞으로는 Hailo-8L에서만 실험"
+
+사용자가 위 7-2절 작업 직후 "앞으로 8L에서 실험할거야 8에서 안해"라고 정정함 — 이후 재차
+"이 실험을 8말고 rpi1인 Hailo-8L에서 실험해보고 싶어"로 확인. 즉 위 7-2절의 Hailo-8(rpi4)용
+산출물은 **더 이상 실행 대상이 아니고, 이 실험을 Hailo-8L(rpi1)로 이관**했다. (7-2절 파일들은
+참고용으로 남겨두되, 실기 실행은 아래 8L 버전으로 진행할 것.)
+
+**포팅하며 새로 확인/작업한 것**:
+1. **HAILO8L용 nms_core HEF 존재 확인**: 공식 hailo_model_zoo
+   (`docs/public_models/HAILO8L/HAILO8L_object_detection.rst`, `raw.githubusercontent.com`으로
+   원문 확인)에 Hailo-8과 동일한 이름·해상도(512x512x3)의 `yolov5xs_wo_spp_nms_core.hef`가
+   `hailo8l` 타겟으로 따로 컴파일되어 배포 중임을 확인:
+   `https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.18.0/hailo8l/yolov5xs_wo_spp_nms_core.hef`
+   (샌드박스 네트워크에서 이 S3 도메인 직접 다운로드는 막혀 있어 curl로 실물 검증은 못 했음 —
+   공식 문서 등재 사실만 근거로 함, RPi에서 스크립트가 wget + `hailortcli parse-hef`로
+   Architecture=HAILO8L 확인까지 하도록 만들어둠). 공식 문서 기준 참고 성능(batch=1): CPU
+   후처리(`yolov5xs_wo_spp`)=206 FPS, NPU 후처리(`yolov5xs_wo_spp_nms_core`)=57.2 FPS — Hailo-8
+   에서 이미 관측한 "NPU 후처리가 오히려 느림" 경향과 방향이 일치.
+2. **hailo_8L 프레임워크에 img_size 파라미터 이식**: `hailo_8L/model_types.hpp`(ModelConfig에
+   `int img_size = 640` 필드 추가)와 `hailo_8L/model_runner.hpp`(run_model_async에 `int
+   img_size = 640` 파라미터 추가, letterbox/zeros 폴백/decode_det 호출에서 하드코딩된 640 대신
+   사용)를 hailo_8 쪽에 이미 있던 동일 변경사항 그대로 포팅함. 둘 다 기본값 640이라 기존
+   `infer_scheduler.cpp`/`infer_scheduler_noppt.cpp`(3모델 프레임워크) 동작에는 영향 없음 —
+   하위 호환 확인됨(`image_utils.hpp::letterbox()`와 `postprocess_8l.hpp::decode_det()`는 원래도
+   이미 `img_size`/`model_input_size` 파라미터를 갖고 있어서 손댈 필요 없었음,
+   `output_classify.hpp::classify_outputs()`도 이미 img_size 파라미터 보유).
+3. **`hailo_8L/infer_yolov5_hailo8l.cpp`** (신규): `hailo_8/infer_yolov5_hailo8.cpp`를 그대로
+   포팅. `postprocess_8l.hpp` 사용, HEF 경로를 8L 관례(`/home/rpi1/hailo-rpi5-examples/
+   resources/yolov5xs_wo_spp_nms_core.hef`, `.../yolov8s_h8l.hef`)로, `IMG_DIR`을
+   `/home/rpi1/datasets/sampled_val2017/`로 교체. `USE_CPU_BASELINE_INSTEAD` 매크로로 두
+   HEF를 스위칭하는 로직/CSV 스키마는 100% 동일(두 보드 결과를 나중에 같은 컬럼으로 비교
+   가능). `INPUT_FPS=60` 기본 반영. 8L은 rpi4의 `HAILORT_INCLUDE` 비표준 경로 이슈가 없어
+   빌드 커맨드에 `-I` 불필요.
+4. **`hailo_8L/scripts/run_det_v8s_vs_v5npu_fps60.sh`** (신규): `hailo_8L/scripts/*.sh`의 기존
+   관례(`cd ~/hailo_cpp_test` 절대경로, `postprocess_8l.hpp` 존재 확인 등)를 따름.
+   `USE_CPU_BASELINE_INSTEAD`를 sed로 토글해 v5(NPU)/v8s_h8l(CPU) 각 3회씩 자동 빌드·실행(총
+   6회, run_id 1~3=v5 NPU, 4~6=v8s CPU), 같은 CSV에 순차 저장. HEF 없으면 hailo8l 타겟 S3에서
+   자동 다운로드 + `hailortcli parse-hef`로 Architecture 확인 프롬프트 포함. 8L은 rpi4의
+   `hailo_pci` find_vma 크래시 이슈가 보고된 적 없는 보드라(그 버그는 rpi4의 커널 6.12.x
+   계열 한정) 재시도 로직은 최소화(3회)만 남김. 결과 경로:
+   `hailo_8L/experiments/{실행일}_det_v8s_vs_v5npu_fps60_exp1/csv/results_det_v8s_vs_v5npu_fps60.csv`.
+5. **`hailo_8L/scripts/make_avg_csv_det_v8s_vs_v5npu.py`**, **`hailo_8L/scripts/
+   build_xlsx_det_v8s_vs_v5npu.py`** (신규): hailo_8 버전과 CSV 스키마가 완전히 동일해서
+   로직은 그대로, 주석/설명만 8L(v8s_h8l, hailo8l 타겟)에 맞게 갱신. 3개 스크립트 모두
+   더미 데이터로 평균 계산 + xlsx 3시트(컬럼설명/전체(6행)/조건별_3회평균(2행)) 생성까지
+   재검증 완료.
+
+**아직 안 된 것 — 실기 실행 필요**: 샌드박스는 RPi(rpi1) SSH 접근 권한이 없어 직접 실행
+불가. 사용자가 `hailo_8L/infer_yolov5_hailo8l.cpp`(및 이번에 img_size 필드/파라미터가 추가된
+`hailo_8L/model_types.hpp`, `hailo_8L/model_runner.hpp` — 기존 버전을 덮어써야 함, 3모델
+실험 파일들과 헤더를 공유하므로 반드시 최신본으로 교체할 것) + `hailo_8L/scripts/
+run_det_v8s_vs_v5npu_fps60.sh` + `hailo_8L/scripts/make_avg_csv_det_v8s_vs_v5npu.py`(+
+`postprocess_8l.hpp`, `image_utils.hpp`, `output_classify.hpp`, `sys_monitor.hpp`,
+`model_setup.hpp` 등 나머지 헤더 — 이미 rpi1에 있는 버전과 호환되지만, model_types.hpp/
+model_runner.hpp는 이번에 바뀐 버전으로 재scp 필요)를 rpi1(`~/hailo_cpp_test/`)에 scp한 뒤
+`./run_det_v8s_vs_v5npu_fps60.sh` 직접 실행해야 함. 결과 CSV를 PC로 받아온 뒤
+`build_xlsx_det_v8s_vs_v5npu.py`로 최종 xlsx까지 만들 수 있음(CSV를 주면 다음 세션에서 바로
+만들어 줄 수 있음).
 
 ---
 

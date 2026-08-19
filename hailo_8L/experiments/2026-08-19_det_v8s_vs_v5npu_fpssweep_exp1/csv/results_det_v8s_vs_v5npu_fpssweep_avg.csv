@@ -1,0 +1,5 @@
+n_runs,hef_name,input_fps,img_size,batch,threshold,timeout_ms,priority,frame_count,avg_preprocess_ms,avg_latency_ms,avg_postprocess_ms,avg_total_time_ms,total_time_s,run_time_s,cpu_percent,mem_percent,voluntary_ctx_switches,nonvoluntary_ctx_switches,npu_percent,switches_per_s,idle_time_pct,avg_fps_hrtt,avg_latency_hrtt,max_latency_hrtt,activation_hrtt
+3,YOLOv5-NPU-postprocess,0,512,1,1,0,0,673.0000,7.8420,491.0050,0.0155,498.8627,34.2029,34.2146,7.8653,21.2883,1375.6667,702.6667,98.1394,0.0340,0.0157,19.6767,403.8137,407.9913,4.5223
+3,Detection-CPU-baseline,0,640,1,1,0,0,673.0000,7.4420,419.7700,0.0087,427.2207,24.7158,24.7282,13.5697,13.2753,3354.0000,719.0000,99.2528,0.0400,0.0010,27.2360,286.2480,288.7120,0.1940
+3,YOLOv5-NPU-postprocess,30,512,1,1,0,0,673.0000,7.9284,486.0810,0.0141,494.0237,34.2046,34.2165,6.6492,21.2982,1348.0000,757.3333,98.1302,0.0340,0.0150,19.6753,400.1973,407.5760,4.3537
+3,Detection-CPU-baseline,30,640,1,1,0,0,673.0000,7.2663,392.4000,0.0089,399.6750,24.7095,24.7219,13.7513,13.3632,3368.0000,771.6667,99.2493,0.0400,0.0010,27.2427,273.8657,288.6100,0.1880

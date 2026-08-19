@@ -62,6 +62,12 @@
  *
  * 실행:
  *   ./infer_yolov5_hailo8 [run_id] [csv_path]
+ *
+ * [2026-08-19 추가] "Det 단일모델, v8s(CPU 후처리) vs v5-nms_core(NPU 후처리), FPS=60,
+ * 3회 반복 후 평균" 실험은 이 파일을 그대로 사용하고 scripts/run_det_v8s_vs_v5npu_fps60.sh가
+ * USE_CPU_BASELINE_INSTEAD(0=v5/NPU, 1=v8s/CPU)와 INPUT_FPS를 sed로 자동 토글해 양쪽을
+ * 순서대로 빌드/실행한다 — 로직 변경 없음, INPUT_FPS 기본값만 0→60으로 바꿈. 평균/xlsx는
+ * scripts/make_avg_csv_det_v8s_vs_v5npu.py, scripts/build_xlsx_det_v8s_vs_v5npu.py 참고.
  * ------------------------------------------------------------------------
  */
 
@@ -99,8 +105,13 @@ using namespace hailort;
 #define PRIORITY_YOLOV5   0
 
 #define ENABLE_POSTPROCESS  1   // decode_det() 파싱 비용까지 측정(=1). 0이면 파싱 스킵.
-#define INPUT_FPS           0   // 0 = 제한 없음(최대 속도) — 모델 1개 단독 실행이라 스케줄러
-                                 // starvation 문제 자체가 없으므로 기본값 그대로 둠.
+#define INPUT_FPS           60  // [2026-08-19 변경, 기존 0] 사용자 요청: NPU vs CPU 후처리
+                                 // 비교 실험은 FPS=60 기준으로 통일. 모델 1개 단독 실행이라
+                                 // 스케줄러 starvation 문제 자체는 없지만(경쟁 상대가 없음),
+                                 // "후처리 담당 프로세서 차이만 빼고 나머지는 전부 동일 환경"
+                                 // 이라는 실험 조건을 맞추기 위해 입력 속도를 고정한다 — 두
+                                 // 조건(v8s/v5) 모두 이 스크립트가 같은 값을 적용함
+                                 // (scripts/run_det_v8s_vs_v5npu_fps60.sh 참고).
 #define NUM_IMAGES          0   // 0 = IMG_DIR 전체 사용
 
 #define YOLOV5_IMG_SIZE   512   // yolov5xs_wo_spp_nms_core 모델 입력 크기(다른 세 모델은 640)

@@ -14,10 +14,10 @@ for hrtt in "$HRTT_DIR"/*.hrtt; do
     name=$(basename "$hrtt" .hrtt)
 
     echo "변환 중: $name"
-    hailort_report "$hrtt"
+    hailo runtime-profiler "$hrtt"
 
-    if [ -f "$HRTT_DIR/runtime_report.html" ]; then
-        cp "$HRTT_DIR/runtime_report.html" "$HTML_DIR/${name}.html"
+    if [ -f "./runtime_report.html" ]; then
+        mv "./runtime_report.html" "$HTML_DIR/${name}.html"
         echo "  → $HTML_DIR/${name}.html"
         found=$((found + 1))
     else

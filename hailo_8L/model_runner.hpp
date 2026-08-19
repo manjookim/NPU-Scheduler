@@ -5,6 +5,8 @@
 // DEBUG_WRITE_TIMING)과 `std::mutex print_mutex;` 정의보다 뒤에 include 되어야 한다 —
 // 매크로/전역변수를 그대로 사용하기 때문. postprocess_8l.hpp의 decode_det/pose/seg,
 // image_utils.hpp의 letterbox/now_ms, sys_monitor.hpp의 CtxSwitches도 필요하다.
+// [2026-08-19] run_model_async에 img_size 파라미터 추가(기본값 640, hailo_8와 동일 포팅) —
+// infer_yolov5_hailo8l.cpp가 512x512 YOLOv5 nms_core HEF를 같은 함수로 돌리기 위함.
 
 #include "hailo/hailort.hpp"
 #include <opencv2/opencv.hpp>
@@ -29,7 +31,11 @@ inline void run_model_async(const char* model_name,
                      const std::vector<std::string>& images,  // [2026-07-28] 파일 경로만 공유. 전처리(imread+letterbox)는
                                                                // 더이상 미리 한꺼번에 하지 않고 writer 스레드 루프 안에서
                                                                // 프레임마다 수행한다.
-                     ModelResult& result)
+                     ModelResult& result,
+                     int img_size = 640)  // [2026-08-19 추가, hailo_8/model_runner.hpp에서 포팅] YOLOv5
+                                           // nms_core(512x512) 등 640이 아닌 입력 크기 모델 지원용.
+                                           // 기본값 640이라 기존 3모델 호출부는 인자를 안 줘도
+                                           // 그대로 640으로 동작(하위 호환).
 {
     if (inputs.empty() || outputs.empty()) {
         std::lock_guard<std::mutex> lock(print_mutex);
@@ -68,10 +74,10 @@ inline void run_model_async(const char* model_name,
                 std::lock_guard<std::mutex> lock(print_mutex);
                 std::cerr << "[" << model_name << "] [경고] 이미지 로드 실패: " << images[i]
                            << " (검은 화면으로 대체, 프레임 수/인덱스 정렬 유지)" << std::endl;
-                lb = cv::Mat::zeros(640, 640, CV_8UC3);
+                lb = cv::Mat::zeros(img_size, img_size, CV_8UC3);
             } else {
                 LetterboxMeta lm;
-                lb = letterbox(img, 640, &lm);
+                lb = letterbox(img, img_size, &lm);
                 cv::cvtColor(lb, lb, cv::COLOR_BGR2RGB);
                 pre_meta[i] = lm;
             }
@@ -143,7 +149,7 @@ inline void run_model_async(const char* model_name,
                     std::vector<PPBox> det_dets = decode_det(reinterpret_cast<const float*>(obuf[0].data()),
                                                               out_meta[0].nms_number_of_classes,
                                                               out_meta[0].nms_max_bboxes_per_class,
-                                                              0.0f, lm);
+                                                              0.0f, lm, img_size);
                     if (i == 0) {
                         std::lock_guard<std::mutex> lock(print_mutex);
                         std::printf("  [디버그][%s] 첫 프레임: 클래스 %d개 x 클래스당 최대 %d개 파싱, 검출=%zu개",

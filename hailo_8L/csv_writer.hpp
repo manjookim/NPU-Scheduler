@@ -44,7 +44,11 @@ inline void save_csv(const std::string& csv_path, int run_id,
         // [2026-07-28] Hailo-8에서 포팅: 전처리(모델별 독립 측정)/후처리/장당전체시간.
         "avg_preprocess_ms_det,avg_preprocess_ms_seg,avg_preprocess_ms_pose,"
         "postprocess_ms_det,postprocess_ms_seg,postprocess_ms_pose,"     // 장당 평균 후처리(디코딩+NMS)시간
-        "total_time_ms_det,total_time_ms_seg,total_time_ms_pose";        // 장당 전체시간 = 전처리+latency+후처리
+        "total_time_ms_det,total_time_ms_seg,total_time_ms_pose,"        // 장당 전체시간 = 전처리+latency+후처리(측정된 경우만, 안 쟀으면 후처리항=0)
+        // [2026-08-06] 후처리를 뺀 전체시간 = 전처리+latency만(후처리 측정 여부와 무관하게
+        // 항상 이 두 값만 더함). total_time_ms_*와 나란히 두고 "후처리 포함 vs 제외"를
+        // 같은 행에서 바로 비교할 수 있게 하기 위한 컬럼.
+        "total_time_ms_nopp_det,total_time_ms_nopp_seg,total_time_ms_nopp_pose";
 
     // 파일이 없거나 비어 있으면 헤더부터 쓴다.
     bool need_header = true;
@@ -77,6 +81,14 @@ inline void save_csv(const std::string& csv_path, int run_id,
     double det_ttl  = models[0].active ? results[0].avg_total_time_ms : -1;
     double seg_ttl  = models[1].active ? results[1].avg_total_time_ms : -1;
     double pose_ttl = models[2].active ? results[2].avg_total_time_ms : -1;
+    // 후처리 제외 전체시간 = 전처리 + latency만(후처리 측정 여부와 무관하게 항상 이렇게 계산).
+    // 둘 중 하나라도 없으면(-1) 전체를 NaN 처리.
+    auto nopp_total = [](double prep, double lat) {
+        return (prep >= 0 && lat >= 0) ? (prep + lat) : -1;
+    };
+    double det_nopp  = models[0].active ? nopp_total(det_prep, det_lat)  : -1;
+    double seg_nopp  = models[1].active ? nopp_total(seg_prep, seg_lat)  : -1;
+    double pose_nopp = models[2].active ? nopp_total(pose_prep, pose_lat) : -1;
 
     std::ostringstream row;
     row << run_id << ','
@@ -102,7 +114,8 @@ inline void save_csv(const std::string& csv_path, int run_id,
         << dtos(det_tot) << ',' << dtos(seg_tot) << ',' << dtos(pose_tot) << ','
         << dtos(det_prep) << ',' << dtos(seg_prep) << ',' << dtos(pose_prep) << ','
         << dtos(det_pp) << ',' << dtos(seg_pp) << ',' << dtos(pose_pp) << ','
-        << dtos(det_ttl) << ',' << dtos(seg_ttl) << ',' << dtos(pose_ttl);
+        << dtos(det_ttl) << ',' << dtos(seg_ttl) << ',' << dtos(pose_ttl) << ','
+        << dtos(det_nopp) << ',' << dtos(seg_nopp) << ',' << dtos(pose_nopp);
     f << row.str() << "\n";
     f.close();
 
