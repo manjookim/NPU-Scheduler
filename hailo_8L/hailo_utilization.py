@@ -55,7 +55,7 @@ def calculate_cpu_usage(prev, curr):
     return 100.0 * (1 - idle_diff / total_diff) if total_diff else 0.0
 
 if __name__ == "__main__":
-    log_path = "/home/rpi1/hailo_cpp_test/npu_log.txt"
+    log_path = os.path.join(os.path.expanduser("~"), "hailo_cpp_test", "npu_log.txt")
     npu_monitor = HailoMonitor()
     prev_stats = get_cpu_and_mem_stats()
 
