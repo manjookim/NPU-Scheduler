@@ -40,11 +40,14 @@ using namespace hailort;
 #define PRIORITY_SEG    15
 #define PRIORITY_POSE   15
 
+// [2026-08-26] 우리 infer_scheduler.cpp의 "동일조건 비교" 실험(3모델, 600장)과 맞추기 위해
+// USE_SEG/USE_POSE도 켜고 NUM_IMAGES도 600으로 맞춤. 원래 값(USE_SEG=0, USE_POSE=0, NUM_IMAGES=0)
+// 이 필요하면 이 블록만 되돌릴 것.
 #define USE_DET    1
-#define USE_SEG    0
-#define USE_POSE   0
+#define USE_SEG    1
+#define USE_POSE   1
 
-#define NUM_IMAGES      0
+#define NUM_IMAGES      600
 
 #define INPUT_FPS_1   0
 #define INPUT_FPS_2   0
@@ -52,11 +55,13 @@ using namespace hailort;
 
 #define U_QUEUE_SIZE  HAILO_DEFAULT_VSTREAM_QUEUE_SIZE
 
-#define DET_HEF  "/app/tappas/rpi2/sched_cpp_experiment/model/yolov8s.hef"
-#define SEG_HEF  "/app/tappas/rpi2/sched_cpp_experiment/model/yolov8s_seg.hef"
-#define POSE_HEF "/app/tappas/rpi2/sched_cpp_experiment/model/yolov8s_pose.hef"
+// [2026-08-26] 원래 경로(/app/tappas/rpi2/...)는 다른 호스트(rpi2, tappas 도커) 기준이라
+// 이 호스트(npu-rpi1)에는 없음 — npu-rpi1의 실제 경로로 교체(계정명 rpi1->npu-rpi1 변경 반영).
+#define DET_HEF  "/home/npu-rpi1/hailo-rpi5-examples/resources/yolov8s_h8l.hef"
+#define SEG_HEF  "/home/npu-rpi1/hailo-rpi5-examples/resources/yolov8s_seg.hef"
+#define POSE_HEF "/home/npu-rpi1/hailo-rpi5-examples/resources/yolov8s_pose_h8l.hef"
 
-#define IMG_DIR  "/app/tappas/rpi2/mps_cpp_experiment/sampled_val2017/"
+#define IMG_DIR  "/home/npu-rpi1/datasets/sampled_val2017/"
 
 cv::Mat letterbox(const cv::Mat& img, int target_size = 640) {
     int orig_h = img.rows, orig_w = img.cols;
@@ -386,6 +391,7 @@ int main(int argc, char* argv[])
     double total_start_ms = now_ms();
     
     std::vector<std::thread> threads;
+    
     for (size_t k = 0; k < vstreams_per_ng.size(); k++) {
         int mi = active_model_idx[k];
         threads.emplace_back(run_model_async, models[mi].name,

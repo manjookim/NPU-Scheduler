@@ -1,82 +1,3 @@
-/**
- * infer_scheduler.cpp
- * ------------------------------------------------------------------------
- * Hailo-8L (Raspberry Pi 5, 보드명 rpi1) 위에서 Detection / Segmentation / Pose
- * 세 모델을 HailoRT Model Scheduler(ROUND_ROBIN)로 "동시에" 추론하면서, 모델별로
- *   priority / threshold / timeout / batch_size
- * 를 독립적으로 설정해 벤치마킹하기 위한 C++ 프로그램.
- *
- * [2026-07-28] Hailo-8(rpi4)용 infer_scheduler_hailo8.cpp에서 아래 항목을 그대로 포팅:
- *   1) 후처리 추가 — decode_det()(NMS-by-class 파싱+좌표 unpad+COCO id 매핑),
- *      decode_pose()/decode_seg()(DFL 디코딩+NMS+mask 복원). postprocess_8l.hpp 참고.
- *      (예전엔 8L은 후처리 로직이 전혀 없었음 — output vstream을 읽기만 하고 버림)
- *   2) 출력 vstream 포맷을 세 모델 모두 HAILO_FORMAT_TYPE_FLOAT32로 통일
- *      (AUTO에 맡기지 않음 — decode_det()이 float 레이아웃을 가정하고 파싱하므로 필요)
- *   3) 전처리를 프레임별(1장씩)로 이동 — writer 스레드 루프 안에서 imread+letterbox 수행,
- *      모델별 독립 측정(avg_preprocess_ms_det/seg/pose)
- *   4) CSV 컬럼 확장 — avg_preprocess_ms_det/seg/pose, postprocess_ms_det/seg/pose,
- *      total_time_ms_det/seg/pose 추가
- * [주의] Hailo-8 쪽은 실기에서 이 변경들을 테스트해 정상 동작(unpad 좌표 정상 범위 등)을
- * 확인했지만, Hailo-8L에 포팅한 이 파일은 실기 컴파일/실행 검증까지 완료된 상태다.
- * batch 컬럼은 8L 실험 설계(활성 모델 전체에 공통 batch 적용)에 맞춰 기존처럼 단일
- * 컬럼으로 유지함(Hailo-8처럼 batch_det/seg/pose 3컬럼으로 쪼개지 않음).
- *
- * [2026-08-02] 코드 정리(스파게티 코드 개선): 예전엔 전처리/후처리/CSV저장/스케줄러
- * 설정 등 거의 모든 로직이 main() 안에 몰려 있었는데, 기능별로 헤더 파일로 분리했다.
- *   - model_types.hpp    : ModelKind/ModelConfig/ModelResult/OutRole/OutMeta (데이터 타입)
- *   - sys_monitor.hpp    : CPU/메모리/컨텍스트 스위치 측정
- *   - image_utils.hpp    : letterbox 전처리, 이미지 파일 목록, now_ms()
- *   - output_classify.hpp: output vstream 채널수 기반 role 분류
- *   - model_setup.hpp    : HEF 로드→configure→스케줄러 파라미터 설정, vstream 생성
- *   - model_runner.hpp   : 모델별 writer/reader 스레드(1장씩 전처리→추론→후처리)
- *   - csv_writer.hpp     : 결과 CSV 저장
- * 이 파일(infer_scheduler.cpp)엔 실험 자동화 스크립트가 sed로 직접 편집하는 파라미터
- * #define 블록과 main()만 남겼다 — 파일명과 #define 위치를 그대로 유지했기 때문에
- * hailo_8L/scripts/*.sh 의 sed 편집 로직은 수정 없이 그대로 동작한다. 위 헤더들은 전부
- * 이 파일에 #include 되어 결국 하나의 번역단위(.cpp 1개)로 컴파일되므로, 빌드 명령어
- * (g++ infer_scheduler.cpp -o infer_scheduler ...)도 바뀌지 않는다.
- *
- * 입력 데이터: COCO val2017 샘플 이미지(IMG_DIR, 기본 최대 600장) — 더미 버퍼가 아닌
- *            실제 이미지를 읽어 letterbox 전처리 후 추론에 사용한다.
- *
- * 스케줄러 파라미터 적용 근거 (공식 문서/예제, github.com/hailo-ai/hailort, hailo8 브랜치):
- *   - hailort/libhailort/include/hailo/network_group.hpp
- *       set_scheduler_timeout(const std::chrono::milliseconds&, network_name="")
- *         -> 기본값 0ms. "적어도 한 번의 요청이 들어온 뒤" 이 시간이 지나면
- *            threshold 미달이어도 강제로 실행 자격을 얻는다.
- *       set_scheduler_threshold(uint32_t, network_name="")
- *         -> 기본값 1. 큐에 threshold개 요청이 쌓여야 실행 자격을 얻는다(단, timeout이
- *            먼저 지나면 그 전에도 자격을 얻음 — 위 timeout 설명 참고).
- *       set_scheduler_priority(uint8_t, network_name="")
- *         -> 기본값 HAILO_SCHEDULER_PRIORITY_NORMAL. 값이 클수록 우선.
- *       (주의: 세 함수 모두 "network_name 지정 시 특정 네트워크만 설정"은 아직 미지원 —
- *        네트워크그룹 전체 단위로만 적용됨. 본 코드는 모델당 네트워크그룹을 하나씩
- *        따로 configure하므로 문제 없음.)
- *   - hailort/libhailort/examples/cpp/switch_network_groups_example/switch_network_groups_example.cpp
- *       VDevice::create -> create_configure_params(hef) -> batch_size 설정 -> configure(hef)
- *       -> set_scheduler_timeout/threshold/priority -> VStreamsBuilder::create_vstreams(*ng, {}, FORMAT_TYPE)
- *     본 파일의 구조/시그니처는 위 공식 예제를 그대로 따른다.
- *
- * 참고(프로젝트 문서): PROJECT_HANDOFF.md, README.md, docs/setup.md, memory/findings.md
- *   - threshold 효과를 실제로 관측하려면 timeout > 0 이어야 하고(§7),
- *     입력을 한꺼번에 다 밀어넣지 말고 NPU 처리량 근처 속도로 흘려보내야
- *     큐가 상시 포화되지 않아 threshold/timeout이 의미를 가진다.
- *     -> 아래 INPUT_FPS 로 입력 속도를 제한할 수 있다 (0 = 제한 없음/최대속도).
- *
- * 빌드 (RPi):
- *   g++ infer_scheduler.cpp -o infer_scheduler -lhailort $(pkg-config --cflags --libs opencv4) -lpthread -std=c++17
- *
- * 실행:
- *   ./infer_scheduler [run_id] [csv_path]
- *
- * HRTT 트레이스:
- *   export HAILO_TRACE=scheduler
- *   export HAILO_TRACE_TIME_IN_SECONDS_BOUNDED_DUMP=30
- *   export HAILO_TRACE_PATH=/path/to/traces
- *   export HAILO_MONITOR=1
- * ------------------------------------------------------------------------
- */
-
 #include "hailo/hailort.hpp"
 #include <opencv2/opencv.hpp>
 
@@ -102,20 +23,9 @@
 
 using namespace hailort;
 
-// ========================= 파라미터 설정 (모델별로 다르게) =========================
-// [실기 확인된 제약, 공식 문서에 명시 안 됨] threshold는 반드시 그 모델의 batch_size
-// 이하여야 한다. 초과 시 set_scheduler_threshold가 HAILO_INVALID_ARGUMENT로 실패하고
-// (HailoRT 로그: "Threshold must be equal or lower than the maximum batch size!"),
-// 해당 모델은 threshold가 기본값(1)으로 남는다 — [적용확인] 로그의 [실패] 표시로 알 수 있음.
-// 즉 아래 THRESHOLD_* <= BATCH_* 를 항상 지킬 것.
-// [주의] 이 블록의 #define 값들은 hailo_8L/scripts/*.sh 가 sed로 직접 편집한다 —
-// 매크로 이름/줄 형식을 바꾸면 자동화 스크립트가 깨지니 그대로 유지할 것.
-
-// 모델별 batch_size (네트워크그룹 입출력 큐 크기 — 공식 문서: 클수록 pre/post-process가
-// 하드웨어 추론과 병렬화되어 다른 스케줄러 파라미터가 더 잘 작동함)
-#define BATCH_DET       4
-#define BATCH_SEG       8
-#define BATCH_POSE      2
+#define BATCH_DET       1
+#define BATCH_SEG       1
+#define BATCH_POSE      1
 
 // threshold: 네트워크그룹이 스케줄될 "자격"을 얻기 위한 최소 누적 요청 수 (기본값 1)
 // 반드시 threshold <= 같은 줄의 batch_size (위 제약 참고)
@@ -140,7 +50,15 @@ using namespace hailort;
 #define USE_POSE   1
 
 // [진단용] 1=Pose/Seg 디코딩+NMS 수행(정상), 0=디코딩 스킵(후처리 시간 거의 0으로 고정).
-#define ENABLE_POSTPROCESS  1
+#define ENABLE_POSTPROCESS  0
+
+// [진단용, 2026-08-26] output vstream 포맷을 FLOAT32+NHWC로 강제할지 여부.
+// ENABLE_POSTPROCESS와 별도로 독립 조절 가능하게 분리함 — "후처리는 끄되 포맷 변환 비용만
+// 남겨서" 그 비용 자체의 영향을 따로 측정하는 실험용.
+//   ENABLE_POSTPROCESS=0, FORCE_OUTPUT_FLOAT32=0 -> 조교님과 완전 동일 조건(방금 실험)
+//   ENABLE_POSTPROCESS=0, FORCE_OUTPUT_FLOAT32=1 -> 후처리 없음 + FLOAT32 변환 비용만 남김(이번 실험)
+//   ENABLE_POSTPROCESS=1, FORCE_OUTPUT_FLOAT32=1 -> 평소 정상 운영 조건(후처리 O, FLOAT32 필요)
+#define FORCE_OUTPUT_FLOAT32  1
 
 // [진단용, 2026-07-28] 1=batch_size 커지면 vstream 큐도 커지는지 확인하는 write() 블로킹시간
 // 계측(처음 40프레임만 출력). 평소엔 0으로 둘 것 — 이 실험 때만 잠깐 1로 켬.
@@ -155,13 +73,14 @@ using namespace hailort;
 // =====================================================================================
 
 // HEF 경로 (Raspberry Pi 5, hailo-rpi5-examples 리소스)
-#define DET_HEF  "/home/rpi1/hailo-rpi5-examples/resources/yolov8s_h8l.hef"
-#define SEG_HEF  "/home/rpi1/hailo-rpi5-examples/resources/yolov8s_seg.hef"
-#define POSE_HEF "/home/rpi1/hailo-rpi5-examples/resources/yolov8s_pose_h8l.hef"
+// [2026-08-26] 계정명 rpi1 -> npu-rpi1 변경에 따라 홈 디렉토리 경로도 변경됨(/home/npu-rpi1).
+#define DET_HEF  "/home/npu-rpi1/hailo-rpi5-examples/resources/yolov8s_h8l.hef"
+#define SEG_HEF  "/home/npu-rpi1/hailo-rpi5-examples/resources/yolov8s_seg.hef"
+#define POSE_HEF "/home/npu-rpi1/hailo-rpi5-examples/resources/yolov8s_pose_h8l.hef"
 
 // 입력 데이터셋 경로: 조교 제공 sampled_val2017 (RPi에 이미 전송 완료).
 // RPi의 실제 저장 위치가 다르면 이 값만 수정 후 재컴파일할 것.
-#define IMG_DIR  "/home/rpi1/datasets/sampled_val2017/"
+#define IMG_DIR  "/home/npu-rpi1/datasets/sampled_val2017/"
 
 std::mutex print_mutex;
 
@@ -245,12 +164,19 @@ int main(int argc, char* argv[])
     std::vector<std::thread> threads;
     for (size_t k = 0; k < vstreams_per_ng.size(); k++) {
         int mi = active_model_idx[k];
+        // [수정] std::thread는 함수의 기본 인자를 모르므로 img_size를 명시적으로 넘겨야 함
+        // (run_model_async의 img_size=640 기본값은 일반 함수 호출에서만 적용되고, std::thread
+        // 생성자를 통한 간접 호출에서는 무시되어 컴파일 에러가 남).
         threads.emplace_back(run_model_async, models[mi].name, models[mi].kind,
             std::ref(vstreams_per_ng[k].first), std::ref(vstreams_per_ng[k].second),
             std::cref(out_meta_per_ng[k]),
-            std::cref(images), std::ref(results[mi]));
+            std::cref(images), std::ref(results[mi]), models[mi].img_size);
     }
     for (auto& t : threads) t.join();
+
+    // [2026-08-26] join() 직후 바로 측정 — 뒤의 avg_total_time_ms 계산 루프가 끼어들기 전에
+    // 타임스탬프를 찍어서 run_time_s(추론 구간 실측 wall-time)를 더 엄밀하게 잰다.
+    double run_time_s = (now_ms() - t_run_start) / 1000.0;
 
     // 장당 전체시간(전처리-추론-후처리) = 이 모델 자신의 평균 전처리 + 평균 latency + 평균 후처리시간
     for (int i = 0; i < 3; i++) {
@@ -261,7 +187,6 @@ int main(int argc, char* argv[])
         }
     }
 
-    double run_time_s = (now_ms() - t_run_start) / 1000.0;   // 추론 구간 실측 wall-time(초)
     CpuStats cpu_end = read_cpu_stats();
     double final_cpu = calc_cpu_usage(cpu_start, cpu_end);
     double final_mem = read_mem_usage();

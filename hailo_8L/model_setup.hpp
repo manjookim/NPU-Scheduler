@@ -81,20 +81,30 @@ inline hailo_status create_all_vstreams(
 
         auto in_params  = ng->make_input_vstream_params(false, HAILO_FORMAT_TYPE_AUTO,
                               VSTREAM_TIMEOUT_MS, HAILO_DEFAULT_VSTREAM_QUEUE_SIZE);
-        // [2026-07-28 변경, Hailo-8에서 포팅] 세 모델 모두 FLOAT32로 통일.
-        // Detection도 decode_det()가 NMS-by-class 버퍼를 float 배열로 가정하고 파싱하므로
-        // AUTO에 맡기지 않고 명시적으로 FLOAT32를 요청해야 레이아웃이 보장된다.
-        // Segmentation/Pose는 raw tensor라서 order도 NHWC로 추가 고정한다.
+        // [2026-07-28 변경, Hailo-8에서 포팅] ENABLE_POSTPROCESS=1일 때만 세 모델 모두
+        // FLOAT32로 통일한다. Detection도 decode_det()가 NMS-by-class 버퍼를 float 배열로
+        // 가정하고 파싱하므로 AUTO에 맡기지 않고 명시적으로 FLOAT32를 요청해야 레이아웃이
+        // 보장된다. Segmentation/Pose는 raw tensor라서 order도 NHWC로 추가 고정한다.
+        // [2026-08-26 추가] ENABLE_POSTPROCESS=0이면 우리는 output 버퍼를 해석하지 않으므로
+        // 조교님 코드(HAILO_FORMAT_TYPE_AUTO)와 동일 조건으로 되돌린다 — 후처리를 꺼도
+        // FLOAT32 강제 변환(HailoRT 내부 역양자화/재배열) 비용이 남아있어 latency가 달라지는
+        // 문제를 막기 위함(동일 조건 비교 실험용).
+#if FORCE_OUTPUT_FLOAT32
         hailo_format_type_t out_fmt_type = HAILO_FORMAT_TYPE_FLOAT32;
+#else
+        hailo_format_type_t out_fmt_type = HAILO_FORMAT_TYPE_AUTO;
+#endif
         auto out_params = ng->make_output_vstream_params(false, out_fmt_type,
                               VSTREAM_TIMEOUT_MS, HAILO_DEFAULT_VSTREAM_QUEUE_SIZE);
         if (!in_params)  { std::cerr << "input vstream params 실패, status="  << in_params.status()  << std::endl; return in_params.status(); }
         if (!out_params) { std::cerr << "output vstream params 실패, status=" << out_params.status() << std::endl; return out_params.status(); }
 
+#if FORCE_OUTPUT_FLOAT32
         if (kind != ModelKind::DET) {
             for (auto& kv : out_params.value())
                 kv.second.user_buffer_format.order = HAILO_FORMAT_ORDER_NHWC;
         }
+#endif
 
 #if DEBUG_WRITE_TIMING
         // [진단용, 2026-07-28] 큐 크기를 write() 블로킹시간으로 간접추정하지 않고, HailoRT가
