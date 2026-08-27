@@ -1,0 +1,436 @@
+<title>PCIe Gen2 vs Gen3 · 조교님 코드</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+.viz-root {
+  color-scheme: light;
+  --surface-1:      #fcfcfb;
+  --surface-2:      #f4f3ef;
+  --page:           #f9f9f7;
+  --text-primary:   #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted:     #898781;
+  --gridline:       #e1e0d9;
+  --baseline:       #c3c2b7;
+  --border:         rgba(11,11,11,0.10);
+  --series-gen2:    #c0392b; /* Gen2 (before) */
+  --series-gen3:    #1baf7a; /* Gen3 (after)  */
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .viz-root {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --surface-2:      #232322;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --gridline:       #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255,255,255,0.10);
+    --series-gen2:    #e0574a;
+    --series-gen3:    #199e70;
+  }
+}
+:root[data-theme="dark"] .viz-root {
+  color-scheme: dark;
+  --surface-1:      #1a1a19;
+  --surface-2:      #232322;
+  --page:           #0d0d0d;
+  --text-primary:   #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted:     #898781;
+  --gridline:       #2c2c2a;
+  --baseline:       #383835;
+  --border:         rgba(255,255,255,0.10);
+  --series-gen2:    #e0574a;
+  --series-gen3:    #199e70;
+}
+
+.viz-root {
+  background: var(--page);
+  color: var(--text-primary);
+  font-family: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  min-height: 100vh;
+  padding: clamp(20px, 4vw, 56px);
+  box-sizing: border-box;
+}
+.viz-root * { box-sizing: border-box; }
+
+.wrap { max-width: 1180px; margin: 0 auto; display: flex; flex-direction: column; gap: 34px; }
+
+.head { display: flex; flex-direction: column; gap: 10px; }
+.eyebrow {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12.5px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--text-muted); font-weight: 500;
+}
+h1 {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-weight: 600; font-size: clamp(26px, 3.4vw, 38px);
+  margin: 0; line-height: 1.15; text-wrap: balance;
+  letter-spacing: -0.01em;
+}
+.dek {
+  font-size: 15.5px; color: var(--text-secondary); max-width: 66ch; line-height: 1.6; margin: 0;
+}
+.dek code {
+  font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 0.92em;
+  background: var(--surface-2); padding: 0.05em 0.4em; border-radius: 4px; color: var(--text-primary);
+}
+
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.stat { background: var(--surface-1); padding: 18px 20px; display: flex; flex-direction: column; gap: 6px; }
+.stat .label { font-size: 12px; color: var(--text-muted); letter-spacing: 0.02em; line-height: 1.4; }
+.stat .value {
+  font-family: "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums;
+  font-size: 28px; font-weight: 600; letter-spacing: -0.01em;
+  color: var(--series-gen3);
+}
+.stat .sub { font-size: 12.5px; color: var(--text-secondary); }
+
+.legend {
+  display: flex; flex-wrap: wrap; gap: 18px; align-items: center;
+  padding: 14px 18px; background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+}
+.legend-item { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-secondary); }
+.swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+.legend-item b { color: var(--text-primary); font-weight: 600; }
+.legend-spacer { flex: 1 1 auto; min-width: 8px; }
+.table-toggle {
+  font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 12px; letter-spacing: 0.02em;
+  background: var(--surface-2); color: var(--text-primary); border: 1px solid var(--border);
+  border-radius: 6px; padding: 7px 12px; cursor: pointer;
+}
+.table-toggle:hover { background: var(--gridline); }
+.table-toggle:focus-visible { outline: 2px solid var(--series-gen3); outline-offset: 2px; }
+
+.section-label {
+  font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 12px; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--text-muted); margin: 0 0 -14px 2px;
+}
+.grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+@media (max-width: 760px) { .grid3 { grid-template-columns: 1fr; } }
+
+.panel {
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+  padding: 16px 16px 10px; display: flex; flex-direction: column; gap: 10px;
+}
+.panel h3 {
+  margin: 0; font-size: 14px; font-weight: 600; color: var(--text-primary);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+}
+.panel .headline-flag { font-size: 11.5px; color: var(--series-gen3); font-weight: 500; }
+.chart-svg { width: 100%; height: auto; display: block; overflow: visible; }
+.bar { stroke: var(--surface-1); stroke-width: 1; }
+.bar:hover, .bar.hovered { filter: brightness(0.92); }
+.axis-tick { font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 10px; fill: var(--text-muted); }
+.group-label { font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 11px; fill: var(--text-secondary); }
+.grid-line { stroke: var(--gridline); stroke-width: 1; }
+.baseline-line { stroke: var(--baseline); stroke-width: 1; }
+
+.tooltip {
+  position: absolute; pointer-events: none; z-index: 20;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; font-size: 12px; box-shadow: 0 6px 20px rgba(0,0,0,0.18);
+  font-family: "IBM Plex Mono", ui-monospace, monospace; color: var(--text-primary);
+  opacity: 0; transition: opacity 0.1s ease; white-space: nowrap;
+}
+.tooltip.show { opacity: 1; }
+.tooltip .tt-cond { color: var(--text-muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+.tooltip .tt-val { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.chart-host { position: relative; }
+
+.table-view { display: none; }
+.table-view.show { display: block; }
+.table-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-1); }
+table.data { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 560px; }
+table.data caption { text-align: left; padding: 12px 16px 0; font-size: 12px; color: var(--text-muted); font-family: "IBM Plex Mono", ui-monospace, monospace; }
+table.data th, table.data td {
+  padding: 9px 14px; text-align: right; border-bottom: 1px solid var(--gridline);
+  font-variant-numeric: tabular-nums; font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 12.5px;
+}
+table.data th:first-child, table.data td:first-child { text-align: left; font-family: "IBM Plex Sans", sans-serif; }
+table.data th:nth-child(2), table.data td:nth-child(2) { text-align: left; font-family: "IBM Plex Sans", sans-serif; color: var(--text-secondary); }
+table.data thead th { color: var(--text-muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+table.data tbody tr:hover { background: var(--surface-2); }
+
+.foot { font-size: 12.5px; color: var(--text-muted); line-height: 1.7; border-top: 1px solid var(--border); padding-top: 16px; }
+.foot b { color: var(--text-secondary); }
+</style>
+
+<div class="viz-root">
+  <div class="wrap">
+
+    <div class="head">
+      <div class="eyebrow">Hailo-8L · npu-rpi1 · 조교님 코드(infer_scheduler_new.cpp) · 7 조합, fresh 1회씩</div>
+      <h1>PCIe Gen2 → Gen3, 조교님 코드로도 재현</h1>
+      <p class="dek">
+        npu-rpi1의 <code>config.txt</code>에 <code>dtparam=pciex1_gen=3</code>를 추가해 PCIe를
+        Gen2(5GT/s)에서 Gen3(8GT/s)로 전환한 뒤, 조교님이 작성한 <code>infer_scheduler_new.cpp</code>를
+        그대로(코드 수정 없이) 7개 모델조합에 대해 재부팅 직후처럼 "깨끗한" 상태에서 1회씩 실행했다.
+        전 조합에서 배율이 1.9~2.0배로 균일하게 나와, 우리 코드로 확인했던 개선폭이 코드와 무관하게
+        재현됨을 보여준다.
+      </p>
+    </div>
+
+    <div class="stats">
+      <div class="stat">
+        <div class="label">13개 데이터포인트 평균 개선폭</div>
+        <div class="value">1.96x</div>
+        <div class="sub">Gen2 대비 Gen3, 조교님 코드 기준</div>
+      </div>
+      <div class="stat">
+        <div class="label">배율 범위 (최소~최대)</div>
+        <div class="value">1.91~2.01x</div>
+        <div class="sub">단독/2모델/3모델 전 조합에서 균일</div>
+      </div>
+      <div class="stat">
+        <div class="label">이론적 Gen2→Gen3 대역폭비</div>
+        <div class="value">≈1.97x</div>
+        <div class="sub">5GT/s(8b/10b) → 8GT/s(128b/130b)</div>
+      </div>
+    </div>
+
+    <div class="legend">
+      <div class="legend-item"><span class="swatch" style="background:var(--series-gen2)"></span><b>Gen2</b>&nbsp;전환 전 (2026-08-26)</div>
+      <div class="legend-item"><span class="swatch" style="background:var(--series-gen3)"></span><b>Gen3</b>&nbsp;전환 후, fresh 실행 (2026-08-27)</div>
+      <div class="legend-spacer"></div>
+      <button class="table-toggle" id="tableToggleBtn" type="button" aria-pressed="false">표로 보기</button>
+    </div>
+
+    <div id="chartsView">
+      <p class="section-label">단독 실행 (1모델)</p>
+      <div class="grid3" id="grid-single"></div>
+
+      <p class="section-label" style="margin-top:20px">2모델 조합</p>
+      <div class="grid3" id="grid-pair"></div>
+
+      <p class="section-label" style="margin-top:20px">3모델 동시 (Det+Seg+Pose)</p>
+      <div class="grid3" id="grid-triple" style="grid-template-columns: 1fr;"></div>
+    </div>
+
+    <div class="table-view" id="tableView">
+      <div class="table-scroll">
+        <table class="data" id="dataTable">
+          <caption>avg_latency_ms — 조합 × 모델 × Gen (run_id=1, fresh 1회 측정)</caption>
+          <thead>
+            <tr><th>조합</th><th>모델</th><th>Gen2</th><th>Gen3</th><th>배율</th></tr>
+          </thead>
+          <tbody id="dataTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="foot">
+      <b>출처</b> — Gen2: <code>experiments/2026-08-26_abcd_pp_format_sweep_exp1/csv/results_D.csv</code>,
+      Gen3: <code>experiments/2026-08-27_abcd_pp_format_sweep_gen3/csv/results_ta_gen3_7combos.csv</code>.
+      둘 다 <code>infer_scheduler_new.cpp</code>(조교님 코드) 그대로, npu-rpi1 실측, 이미지 600장,
+      batch=1/threshold=1/timeout=0ms/priority=15 고정, 재부팅·드라이버 재로드 직후처럼 연속 실행
+      누적 없이 "첫 스윕"으로 측정한 값. (같은 날 A/B/C/D 28회를 이어서 돌리면 후반 조합일수록
+      배율이 1.35~1.7배로 떨어지는 현상이 별도로 관찰됨 — 원인 미확정, 이 그래프는 그 영향이
+      없는 fresh 조건만 비교.)
+    </div>
+
+  </div>
+</div>
+
+<script>
+(function () {
+  var DATA = {
+    single: [
+      { title: "Detection", models: [
+        { name: "Det", Gen2: 419.093, Gen3: 217.208 }
+      ]},
+      { title: "Segmentation", models: [
+        { name: "Seg", Gen2: 475.666, Gen3: 240.436 }
+      ]},
+      { title: "Pose", models: [
+        { name: "Pose", Gen2: 346.647, Gen3: 181.834 }
+      ]}
+    ],
+    pair: [
+      { title: "Det + Seg", models: [
+        { name: "Det", Gen2: 1036.190, Gen3: 524.616 },
+        { name: "Seg", Gen2: 866.817,  Gen3: 439.105 }
+      ]},
+      { title: "Det + Pose", models: [
+        { name: "Det",  Gen2: 921.189, Gen3: 460.639 },
+        { name: "Pose", Gen2: 759.362, Gen3: 379.798 }
+      ]},
+      { title: "Seg + Pose", models: [
+        { name: "Seg",  Gen2: 886.919, Gen3: 441.381 },
+        { name: "Pose", Gen2: 874.185, Gen3: 434.050 }
+      ]}
+    ],
+    triple: [
+      { title: "Det + Seg + Pose", models: [
+        { name: "Det",  Gen2: 1474.080, Gen3: 755.066 },
+        { name: "Seg",  Gen2: 1225.190, Gen3: 626.946 },
+        { name: "Pose", Gen2: 1211.150, Gen3: 619.454 }
+      ]}
+    ]
+  };
+
+  var SERIES = ["Gen2", "Gen3"];
+  var COLOR_VAR = { Gen2: "--series-gen2", Gen3: "--series-gen3" };
+  var Y_MAX = 1550;
+
+  function topRoundedRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h);
+    if (h <= 0) return "";
+    return "M" + x + "," + (y + h) +
+      " L" + x + "," + (y + r) +
+      " Q" + x + "," + y + " " + (x + r) + "," + y +
+      " L" + (x + w - r) + "," + y +
+      " Q" + (x + w) + "," + y + " " + (x + w) + "," + (y + r) +
+      " L" + (x + w) + "," + (y + h) + " Z";
+  }
+
+  function renderPanel(container, panelData, opts) {
+    var panel = document.createElement("div");
+    panel.className = "panel";
+
+    var h3 = document.createElement("h3");
+    h3.textContent = panelData.title;
+    panel.appendChild(h3);
+
+    var host = document.createElement("div");
+    host.className = "chart-host";
+    panel.appendChild(host);
+
+    var W = opts.width, H = opts.height;
+    var padLeft = 40, padBottom = 22, padTop = 8, padRight = 8;
+    var plotW = W - padLeft - padRight;
+    var plotH = H - padTop - padBottom;
+
+    var svgNS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    svg.classList.add("chart-svg");
+    host.appendChild(svg);
+
+    var ticks = [0, 500, 1000, 1500];
+    ticks.forEach(function (t) {
+      var yy = padTop + plotH - (t / Y_MAX) * plotH;
+      var line = document.createElementNS(svgNS, "line");
+      line.setAttribute("x1", padLeft); line.setAttribute("x2", W - padRight);
+      line.setAttribute("y1", yy); line.setAttribute("y2", yy);
+      line.setAttribute("class", "grid-line");
+      svg.appendChild(line);
+      var label = document.createElementNS(svgNS, "text");
+      label.setAttribute("x", padLeft - 8); label.setAttribute("y", yy + 3);
+      label.setAttribute("text-anchor", "end");
+      label.setAttribute("class", "axis-tick");
+      label.textContent = t;
+      svg.appendChild(label);
+    });
+    var base = document.createElementNS(svgNS, "line");
+    base.setAttribute("x1", padLeft); base.setAttribute("x2", W - padRight);
+    base.setAttribute("y1", padTop + plotH); base.setAttribute("y2", padTop + plotH);
+    base.setAttribute("class", "baseline-line");
+    svg.appendChild(base);
+
+    var nGroups = panelData.models.length;
+    var groupGap = 22;
+    var groupW = (plotW - groupGap * (nGroups - 1)) / nGroups;
+    var barGap = 4;
+    var barW = (groupW - barGap * (SERIES.length - 1)) / SERIES.length;
+
+    panelData.models.forEach(function (m, gi) {
+      var gx = padLeft + gi * (groupW + groupGap);
+
+      var glabel = document.createElementNS(svgNS, "text");
+      glabel.setAttribute("x", gx + groupW / 2);
+      glabel.setAttribute("y", H - 6);
+      glabel.setAttribute("text-anchor", "middle");
+      glabel.setAttribute("class", "group-label");
+      glabel.textContent = m.name;
+      svg.appendChild(glabel);
+
+      SERIES.forEach(function (s, si) {
+        var val = m[s];
+        var bh = (val / Y_MAX) * plotH;
+        var bx = gx + si * (barW + barGap);
+        var by = padTop + plotH - bh;
+
+        var path = document.createElementNS(svgNS, "path");
+        path.setAttribute("d", topRoundedRectPath(bx, by, barW, bh, 3));
+        path.setAttribute("fill", "var(" + COLOR_VAR[s] + ")");
+        path.classList.add("bar");
+        path.style.cursor = "pointer";
+
+        path.addEventListener("mousemove", function (evt) {
+          showTooltip(evt, panelData.title, m.name, s, val, m);
+        });
+        path.addEventListener("mouseleave", hideTooltip);
+
+        svg.appendChild(path);
+      });
+    });
+
+    container.appendChild(panel);
+  }
+
+  var tooltipEl;
+  function ensureTooltip() {
+    if (!tooltipEl) {
+      tooltipEl = document.createElement("div");
+      tooltipEl.className = "tooltip";
+      document.querySelector(".viz-root").appendChild(tooltipEl);
+    }
+    return tooltipEl;
+  }
+  function showTooltip(evt, panelTitle, modelName, series, val, m) {
+    var tt = ensureTooltip();
+    var condLabel = { Gen2: "Gen2 (전)", Gen3: "Gen3 (후)" }[series];
+    var ratio = (m.Gen2 / m.Gen3).toFixed(2);
+    tt.innerHTML = '<div class="tt-cond">' + panelTitle + " / " + modelName + '</div>' +
+      '<div>' + condLabel + ' &nbsp; <span class="tt-val">' + val.toFixed(1) + ' ms</span></div>' +
+      '<div style="color:var(--text-muted); font-size:10.5px; margin-top:2px;">Gen2/Gen3 = ' + ratio + 'x</div>';
+    var rootRect = document.querySelector(".viz-root").getBoundingClientRect();
+    tt.style.left = (evt.clientX - rootRect.left + 14) + "px";
+    tt.style.top = (evt.clientY - rootRect.top + 14) + "px";
+    tt.classList.add("show");
+  }
+  function hideTooltip() { if (tooltipEl) tooltipEl.classList.remove("show"); }
+
+  var gridSingle = document.getElementById("grid-single");
+  var gridPair = document.getElementById("grid-pair");
+  var gridTriple = document.getElementById("grid-triple");
+
+  DATA.single.forEach(function (p) { renderPanel(gridSingle, p, { width: 340, height: 210 }); });
+  DATA.pair.forEach(function (p) { renderPanel(gridPair, p, { width: 340, height: 210 }); });
+  DATA.triple.forEach(function (p) { renderPanel(gridTriple, p, { width: 1080, height: 260 }); });
+
+  var tbody = document.getElementById("dataTableBody");
+  var allGroups = DATA.single.concat(DATA.pair).concat(DATA.triple);
+  allGroups.forEach(function (p) {
+    p.models.forEach(function (m) {
+      var tr = document.createElement("tr");
+      var ratio = (m.Gen2 / m.Gen3).toFixed(2);
+      tr.innerHTML =
+        "<td>" + p.title + "</td>" +
+        "<td>" + m.name + "</td>" +
+        "<td>" + m.Gen2.toFixed(1) + "</td>" +
+        "<td>" + m.Gen3.toFixed(1) + "</td>" +
+        "<td>" + ratio + "x</td>";
+      tbody.appendChild(tr);
+    });
+  });
+
+  var btn = document.getElementById("tableToggleBtn");
+  var chartsView = document.getElementById("chartsView");
+  var tableView = document.getElementById("tableView");
+  var showingTable = false;
+  btn.addEventListener("click", function () {
+    showingTable = !showingTable;
+    tableView.classList.toggle("show", showingTable);
+    chartsView.style.display = showingTable ? "none" : "";
+    btn.setAttribute("aria-pressed", String(showingTable));
+    btn.textContent = showingTable ? "그래프로 보기" : "표로 보기";
+  });
+})();
+</script>

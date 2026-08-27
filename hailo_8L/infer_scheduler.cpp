@@ -55,10 +55,10 @@ using namespace hailort;
 // [진단용, 2026-08-26] output vstream 포맷을 FLOAT32+NHWC로 강제할지 여부.
 // ENABLE_POSTPROCESS와 별도로 독립 조절 가능하게 분리함 — "후처리는 끄되 포맷 변환 비용만
 // 남겨서" 그 비용 자체의 영향을 따로 측정하는 실험용.
-//   ENABLE_POSTPROCESS=0, FORCE_OUTPUT_FLOAT32=0 -> 조교님과 완전 동일 조건(방금 실험)
-//   ENABLE_POSTPROCESS=0, FORCE_OUTPUT_FLOAT32=1 -> 후처리 없음 + FLOAT32 변환 비용만 남김(이번 실험)
+//   ENABLE_POSTPROCESS=0, FORCE_OUTPUT_FLOAT32=0 -> 조교님과 완전 동일 조건 (현재 이 상태)
+//   ENABLE_POSTPROCESS=0, FORCE_OUTPUT_FLOAT32=1 -> 후처리 없음 + FLOAT32 변환 비용만 남김
 //   ENABLE_POSTPROCESS=1, FORCE_OUTPUT_FLOAT32=1 -> 평소 정상 운영 조건(후처리 O, FLOAT32 필요)
-#define FORCE_OUTPUT_FLOAT32  1
+#define FORCE_OUTPUT_FLOAT32  0
 
 // [진단용, 2026-07-28] 1=batch_size 커지면 vstream 큐도 커지는지 확인하는 write() 블로킹시간
 // 계측(처음 40프레임만 출력). 평소엔 0으로 둘 것 — 이 실험 때만 잠깐 1로 켬.
@@ -81,7 +81,6 @@ using namespace hailort;
 // 입력 데이터셋 경로: 조교 제공 sampled_val2017 (RPi에 이미 전송 완료).
 // RPi의 실제 저장 위치가 다르면 이 값만 수정 후 재컴파일할 것.
 #define IMG_DIR  "/home/npu-rpi1/datasets/sampled_val2017/"
-
 std::mutex print_mutex;
 
 #include "model_types.hpp"

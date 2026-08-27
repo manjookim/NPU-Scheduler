@@ -1,0 +1,8 @@
+run_id,use_det,use_seg,use_pose,batch,threshold_det,threshold_seg,threshold_pose,timeout_ms,priority_det,priority_seg,priority_pose,det_latency_ms,seg_latency_ms,pose_latency_ms,
+1,1,0,0,1,1,1,1,0,15,15,15,217.208,NaN,NaN,
+2,0,1,0,1,1,1,1,0,15,15,15,NaN,240.436,NaN,
+3,0,0,1,1,1,1,1,0,15,15,15,NaN,NaN,181.834,
+4,1,1,0,1,1,1,1,0,15,15,15,524.616,439.105,NaN,
+5,1,0,1,1,1,1,1,0,15,15,15,460.639,NaN,379.798,
+6,0,1,1,1,1,1,1,0,15,15,15,NaN,441.381,434.05,
+7,1,1,1,1,1,1,1,0,15,15,15,755.066,626.946,619.454,
