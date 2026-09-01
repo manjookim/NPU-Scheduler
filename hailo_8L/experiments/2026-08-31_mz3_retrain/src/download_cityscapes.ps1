@@ -26,10 +26,15 @@ $sec  = Read-Host "Cityscapes 비밀번호" -AsSecureString
 $pass = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
         [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
 
-Write-Host "`n[0/3] 로그인" -ForegroundColor Yellow
-& $curl -s -c cookies.txt -d "username=$user&password=$pass&submit=Login" `
-        "https://www.cityscapes-dataset.com/login/" -o $env:TEMP\cs_login.html
+# 비밀번호에 & = + 같은 문자가 있으면 POST 본문이 깨지므로 URL 인코딩한다
+$userEnc = [uri]::EscapeDataString($user)
+$passEnc = [uri]::EscapeDataString($pass)
 $pass = $null
+
+Write-Host "`n[0/3] 로그인" -ForegroundColor Yellow
+& $curl -s -c cookies.txt -d "username=$userEnc&password=$passEnc&submit=Login" `
+        "https://www.cityscapes-dataset.com/login/" -o $env:TEMP\cs_login.html
+$passEnc = $null
 
 # 로그인 실패하면 이후 다운로드가 HTML 파일을 내려받아 조용히 망가지므로 여기서 검사
 if (-not (Select-String -Path cookies.txt -Pattern "PHPSESSID" -Quiet)) {
