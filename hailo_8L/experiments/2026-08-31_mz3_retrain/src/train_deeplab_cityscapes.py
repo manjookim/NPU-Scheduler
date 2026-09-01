@@ -177,21 +177,40 @@ class ASPP(nn.Module):
 
 
 class DeepLabV3MNv2(nn.Module):
-    """MobileNetV2(OS=32, dilation 없음) + ASPP + 1x1 classifier.
+    """MobileNetV2(OS=32, dilation 없음) + 헤드 + bilinear 업샘플 (+ export 시 argmax).
+
+    [헤드 선택 — head 인자]
+      "simple" (기본, **공식 구성**):
+          백본(1280ch) -> Conv2d(1280, num_classes, 1) 하나.
+          TF research/deeplab 의 --model_variant="mobilenet_v2" 는 atrous_rates 를 주지
+          않으면 ASPP 를 만들지 않고 1x1 logits conv 만 붙인다. 그 구성이 Hailo Model Zoo
+          deeplab_v3_mobilenet_v2_wo_dilation 의 **2.10M 파라미터 / 3.21 GOPs** 와 맞는다.
+          -> 약 2.25M. 공식과 거의 동일해서 latency/컨텍스트 비교가 성립한다.
+
+      "aspp":
+          ASPP(3x3 브랜치 3개, 1280->256)를 붙인 무거운 변형. 약 11.7M 파라미터로
+          **공식 대비 5.6배**라 스케줄링 비교에는 쓰면 안 된다. 참고용으로만 남겨둔다.
+
     export=True 로 두면 bilinear 업샘플 + argmax 까지 그래프에 포함한다(Hailo 규약)."""
 
-    def __init__(self, num_classes=NUM_CLASSES, pretrained=True, export=False):
+    def __init__(self, num_classes=NUM_CLASSES, pretrained=True, export=False, head="simple"):
         super().__init__()
         from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
         w = MobileNet_V2_Weights.IMAGENET1K_V1 if pretrained else None
         self.backbone = mobilenet_v2(weights=w).features   # 출력 1280ch, stride 32
-        self.aspp = ASPP(1280)
-        self.classifier = nn.Conv2d(256, num_classes, 1)
+        self.head = head
+        if head == "aspp":
+            self.aspp = ASPP(1280)
+            self.classifier = nn.Conv2d(256, num_classes, 1)
+        else:
+            self.aspp = None
+            self.classifier = nn.Conv2d(1280, num_classes, 1)
         self.export = export
 
     def forward(self, x):
         f = self.backbone(x)
-        f = self.aspp(f)
+        if self.aspp is not None:
+            f = self.aspp(f)
         logits = self.classifier(f)
         logits = F.interpolate(logits, size=(IMG, IMG), mode="bilinear", align_corners=False)
         if self.export:
@@ -241,6 +260,8 @@ def main():
     ap.add_argument("--batch", type=int, default=4, help="RTX 5060 8GB 기준 4~6 권장")
     ap.add_argument("--lr", type=float, default=0.02)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--head", choices=["simple", "aspp"], default="simple",
+                    help="simple=공식 구성(1x1 conv, ~2.25M) / aspp=무거운 변형(~11.7M)")
     ap.add_argument("--resume", action="store_true", help="out/last.pt 에서 이어서")
     ap.add_argument("--eval-only", action="store_true")
     ap.add_argument("--export-onnx", metavar="PATH")
@@ -254,7 +275,7 @@ def main():
 
     # ── ONNX export 전용 경로 (데이터셋 불필요) ──
     if a.export_onnx:
-        model = DeepLabV3MNv2(pretrained=False, export=True)
+        model = DeepLabV3MNv2(pretrained=False, export=True, head=a.head)
         ck = torch.load(os.path.join(a.out, "best.pt"), map_location="cpu")
         model.load_state_dict(ck["model"])
         model.eval()
@@ -284,11 +305,17 @@ def main():
     val = DataLoader(va, batch_size=a.batch, shuffle=False, num_workers=a.workers,
                      pin_memory=True)
 
-    model = DeepLabV3MNv2(pretrained=True).to(dev)
+    model = DeepLabV3MNv2(pretrained=True, head=a.head).to(dev)
+    n_par = sum(p.numel() for p in model.parameters())
+    print(f"헤드={a.head}  파라미터={n_par/1e6:.2f}M  "
+          f"(공식 deeplab_v3_mobilenet_v2_wo_dilation = 2.10M)")
+    if n_par > 4e6:
+        print("  [경고] 공식 대비 파라미터가 크게 많습니다 — latency/컨텍스트 비교가 성립하지 않습니다.")
     # 백본은 ImageNet 사전학습이므로 lr 을 1/10 로
     opt = torch.optim.SGD([
         {"params": model.backbone.parameters(), "lr": a.lr * 0.1},
-        {"params": list(model.aspp.parameters()) + list(model.classifier.parameters()),
+        {"params": (list(model.aspp.parameters()) if model.aspp is not None else [])
+                   + list(model.classifier.parameters()),
          "lr": a.lr},
     ], momentum=0.9, weight_decay=1e-4, nesterov=True)
     scaler = torch.amp.GradScaler("cuda")

@@ -61,7 +61,6 @@ struct Model {
 
     // 결과
     double avg_latency_ms = -1;
-    double max_latency_ms = -1;
     double avg_preprocess_ms = -1;
     double total_time_s = -1;
     double fps = -1;
@@ -202,139 +201,79 @@ static void run_model_async(Model& m,
                   << " read_status=" << read_status << std::endl;
     }
 
-    // [2026-09-01] 원본 hailo_8L/model_runner.hpp 와 정의를 통일.
-    //   · latency  = deq_ts[i] - enq_ts[i] 의 평균 (deq > enq 인 프레임만)  — 원본과 동일
-    //   · max_latency = 그 최댓값 (원본 8L 은 HRTT 에서 채우지만 host 실측으로 대체.
-    //                   Hailo-10H 벤치와 같은 방침 — HRTT_ON_HAILO10H.md §5-1)
-    //   · total_time_s = 첫 enqueue ~ 마지막 dequeue 구간 (그 모델이 실제로 일한 구간).
-    //                    이전 버전은 함수진입~join 이라 스레드 생성/소멸 오버헤드가 섞여 있었음.
-    double sum = 0.0, mx = -1.0;
+    double sum = 0.0;
     int cnt = 0;
     for (size_t i = 0; i < N; i++) {
-        if (deq_ts[i] > enq_ts[i]) {
-            double d = deq_ts[i] - enq_ts[i];
-            sum += d;
-            if (d > mx) mx = d;
+        if (deq_ts[i] > 0 && enq_ts[i] > 0) {
+            sum += (deq_ts[i] - enq_ts[i]);
             cnt++;
         }
     }
     m.avg_latency_ms = (cnt > 0) ? (sum / cnt) : -1;
-    m.max_latency_ms = mx;
     m.frame_count = cnt;
-
-    double first_enq = 0, last_deq = 0;
-    for (size_t i = 0; i < N; i++) {
-        if (enq_ts[i] > 0 && (first_enq == 0 || enq_ts[i] < first_enq)) first_enq = enq_ts[i];
-        if (deq_ts[i] > last_deq) last_deq = deq_ts[i];
-    }
-    m.total_time_s = (last_deq > first_enq) ? (last_deq - first_enq) / 1000.0 : -1;
+    m.total_time_s = (t_end - t_start) / 1000.0;
     m.fps = (m.total_time_s > 0) ? (cnt / m.total_time_s) : -1;
-    (void)t_end; (void)t_start;
     m.avg_preprocess_ms = (prep_count > 0) ? (prep_total_ms / prep_count) : -1;
     m.vol_ctx = w_vol + r_vol;
     m.nonvol_ctx = w_nonvol + r_nonvol;
 }
 
 // ───────────────────────────── CSV ─────────────────────────────
-// [2026-09-01] hailo_8L/csv_writer.hpp 스키마를 그대로 따른다 (det/seg/pose -> ssd/deeplab/mnv2).
-// 컬럼 순서·이름·NaN 관례를 원본과 맞춰야 기존 YOLOv8 실험 결과와 같은 표에 놓을 수 있다.
-//
-// [값 채우는 규칙 — 원본 관례 유지]
-//   · batch / threshold_* / timeout_ms / priority_* : 이 벤치는 setter 를 호출하지 않으므로
-//     HailoRT 기본값(0 / 1 / 0 / 16)을 그대로 기록한다. 값이 고정이어도 남겨야 나중에
-//     파라미터 스윕 결과와 같은 표에서 비교할 수 있다.
-//   · npu_percent / switches_per_s / idle_time_pct / activation_* : 여기서는 NaN.
-//     npu_percent 는 스윕 스크립트가 hailo_utilization.py 로 따로 재서 병합하고,
-//     나머지는 HRTT(.hrtt) 파싱으로 채운다 — 원본 8L 과 동일한 절차.
-//   · avg_fps_* / max_latency_* : 원본 8L 은 HRTT 에서 채우지만 여기선 host 실측으로 채운다
-//     (Hailo-10H 벤치와 같은 방침, HRTT_ON_HAILO10H.md §5-1).
-//     avg_fps 는 전처리 포함, latency 는 전처리 제외라 fps != 1000/latency 인 점 주의.
-//   · postprocess_ms_* : 이 워크로드는 host 후처리를 하지 않으므로 항상 NaN.
-//     (SSD 는 on-chip NMS, DeepLab 은 bilinear+argmax 가 칩에서, MobileNetV2 는 Softmax 가 그래프 내부)
-//     따라서 total_time_ms_* 와 total_time_ms_nopp_* 는 항상 같은 값이다.
 static void write_csv(const std::string& path, const std::string& tag, int run_id, int input_fps,
                       int frames, const std::vector<Model>& models, double cpu, double mem,
                       double wall_s) {
-    static const char* HEADER =
-        "tag,run_id,use_ssd,use_deeplab,use_mnv2,batch,"
-        "threshold_ssd,threshold_deeplab,threshold_mnv2,timeout_ms,"
-        "priority_ssd,priority_deeplab,priority_mnv2,"
-        "ssd_latency_ms,deeplab_latency_ms,mnv2_latency_ms,"
-        "cpu_percent,mem_percent,voluntary_ctx_switches,nonvoluntary_ctx_switches,"
-        "npu_percent,switches_per_s,idle_time_pct,run_time_s,"
-        "avg_fps_ssd,avg_latency_ssd,max_latency_ssd,activation_ssd,"
-        "avg_fps_deeplab,avg_latency_deeplab,max_latency_deeplab,activation_deeplab,"
-        "avg_fps_mnv2,avg_latency_mnv2,max_latency_mnv2,activation_mnv2,"
-        "total_time_ssd_s,total_time_deeplab_s,total_time_mnv2_s,"
-        "avg_preprocess_ms_ssd,avg_preprocess_ms_deeplab,avg_preprocess_ms_mnv2,"
-        "postprocess_ms_ssd,postprocess_ms_deeplab,postprocess_ms_mnv2,"
-        "total_time_ms_ssd,total_time_ms_deeplab,total_time_ms_mnv2,"
-        "total_time_ms_nopp_ssd,total_time_ms_nopp_deeplab,total_time_ms_nopp_mnv2,"
-        // ↓ MZ3 전용 추가 컬럼 (원본 스키마 뒤에 붙여서 앞쪽 정렬을 깨지 않는다)
-        "input_fps,frames,ssd_frame_count,deeplab_frame_count,mnv2_frame_count,wall_time_s";
-
     bool need_header = true;
     {
-        std::ifstream fchk(path);
-        if (fchk.good() && fchk.peek() != std::ifstream::traits_type::eof()) need_header = false;
+        std::ifstream f(path);
+        if (f.good() && f.peek() != std::ifstream::traits_type::eof()) need_header = false;
     }
     std::ofstream f(path, std::ios::app);
     if (!f) {
         std::cerr << "[에러] CSV 열기 실패: " << path << std::endl;
         return;
     }
-    if (need_header) f << HEADER << "\n";
-
-    const char* KEYS[3] = {"ssd", "deeplab", "mnv2"};
-    const Model* M[3] = {nullptr, nullptr, nullptr};
-    for (int k = 0; k < 3; k++)
-        for (auto& m : models)
-            if (m.key == KEYS[k]) { M[k] = &m; break; }
-
-    auto on = [&](int k) { return (M[k] && M[k]->active); };
-    // 비활성 모델은 원본 csv_writer.hpp 관례대로 NaN
-    auto v = [&](int k, double val) { if (!on(k)) f << "NaN"; else f << val; };
-
-    long vol = 0, nonvol = 0;
-    for (auto& m : models) if (m.active) { vol += m.vol_ctx; nonvol += m.nonvol_ctx; }
-
-    f << tag << ',' << run_id << ',';
-    for (int k = 0; k < 3; k++) f << (on(k) ? 1 : 0) << ',';
-
-    // 스케줄러 파라미터 — setter 미호출이므로 HailoRT 기본값을 기록
-    f << 0 << ',';                                   // batch (0 = auto)
-    f << 1 << ',' << 1 << ',' << 1 << ',';           // threshold x3
-    f << 0 << ',';                                   // timeout_ms
-    f << 16 << ',' << 16 << ',' << 16 << ',';        // priority x3 (NORMAL)
-
-    for (int k = 0; k < 3; k++) { v(k, M[k] ? M[k]->avg_latency_ms : 0); f << ','; }
-
-    f << cpu << ',' << mem << ',' << vol << ',' << nonvol << ',';
-    f << "NaN" << ',' << "NaN" << ',' << "NaN" << ',';   // npu_percent, switches_per_s, idle_time_pct
-    f << wall_s << ',';                                  // run_time_s
-
-    for (int k = 0; k < 3; k++) {
-        v(k, M[k] ? M[k]->fps : 0);            f << ',';   // avg_fps_*      (전처리 포함, host 실측)
-        v(k, M[k] ? M[k]->avg_latency_ms : 0); f << ',';   // avg_latency_*  (host 실측)
-        v(k, M[k] ? M[k]->max_latency_ms : 0); f << ',';   // max_latency_*  (host 실측)
-        f << "NaN" << ',';                                 // activation_*   (HRTT 전용)
+    if (need_header) {
+        f << "tag,run_id,input_fps,frames,"
+             "use_ssd,use_deeplab,use_mnv2,"
+             "ssd_latency_ms,deeplab_latency_ms,mnv2_latency_ms,"
+             "ssd_fps,deeplab_fps,mnv2_fps,"
+             "ssd_preprocess_ms,deeplab_preprocess_ms,mnv2_preprocess_ms,"
+             "ssd_total_time_s,deeplab_total_time_s,mnv2_total_time_s,"
+             "cpu_percent,mem_percent,voluntary_ctx_switches,nonvoluntary_ctx_switches,wall_time_s\n";
     }
 
-    for (int k = 0; k < 3; k++) { v(k, M[k] ? M[k]->total_time_s : 0);      f << ','; }
-    for (int k = 0; k < 3; k++) { v(k, M[k] ? M[k]->avg_preprocess_ms : 0); f << ','; }
-    for (int k = 0; k < 3; k++) { f << "NaN" << ','; }     // postprocess_ms_* — host 후처리 없음
-
-    // total_time_ms_* = 전처리 + latency (+ 후처리, 여기선 없음) / total_time_ms_nopp_* 도 동일
-    for (int pass = 0; pass < 2; pass++)
-        for (int k = 0; k < 3; k++) {
-            if (!on(k)) f << "NaN";
-            else f << (M[k]->avg_preprocess_ms + M[k]->avg_latency_ms);
-            f << ',';
+    auto get = [&](const std::string& k) -> const Model* {
+        for (auto& m : models)
+            if (m.key == k) return &m;
+        return nullptr;
+    };
+    auto fld = [&](const std::string& k, int which) {
+        const Model* m = get(k);
+        if (!m || !m->active) {
+            f << "NaN";
+            return;
         }
+        switch (which) {
+            case 0: f << m->avg_latency_ms; break;
+            case 1: f << m->fps; break;
+            case 2: f << m->avg_preprocess_ms; break;
+            case 3: f << m->total_time_s; break;
+        }
+    };
 
-    f << input_fps << ',' << frames << ',';
-    for (int k = 0; k < 3; k++) { if (!on(k)) f << "NaN"; else f << M[k]->frame_count; f << ','; }
-    f << wall_s << "\n";
+    long vol = 0, nonvol = 0;
+    for (auto& m : models)
+        if (m.active) { vol += m.vol_ctx; nonvol += m.nonvol_ctx; }
+
+    f << tag << "," << run_id << "," << input_fps << "," << frames << ",";
+    for (auto k : {"ssd", "deeplab", "mnv2"}) {
+        const Model* m = get(k);
+        f << ((m && m->active) ? 1 : 0) << ",";
+    }
+    for (int which : {0, 1, 2, 3}) {
+        for (auto k : {"ssd", "deeplab", "mnv2"}) { fld(k, which); f << ","; }
+    }
+    f << cpu << "," << mem << "," << vol << "," << nonvol << "," << wall_s << "\n";
 }
 
 // ───────────────────────────── main ─────────────────────────────
