@@ -25,10 +25,33 @@
 set -u
 cd "$HOME/mz3_exp" || exit 1
 
+# ── 어떤 mobilenet_v2 HEF 를 쓸지 (MNV2_HEF) ───────────────────────────
+#   mobilenet_v2_1.0_gtsrb.hef      재학습, 공식 alls 3줄        -> 2 contexts
+#   mobilenet_v2_1.0_gtsrb_sc.hef   재학습, +context_switch_param -> 1 context
+#   mobilenet_v2_1.0.hef            ImageNet 원본                -> 1 context
+# 가중치는 같고 컨텍스트 수만 다른 gtsrb vs gtsrb_sc 를 비교하면
+# "재학습 효과"와 "컨텍스트 전환 비용"을 분리할 수 있다.
+MNV2_HEF="${MNV2_HEF:-mobilenet_v2_1.0_gtsrb.hef}"
+MNV2_SUF=""
+case "$MNV2_HEF" in
+    *_sc.hef)     MNV2_SUF="_sc"  ;;
+    mobilenet_v2_1.0.hef) MNV2_SUF="_orig" ;;
+esac
+
 BIN=./mz3_sched_bench
 RES="$HOME/mz3_exp/resources_retrained"
+
+mkdir -p "$RES"
+for h in ssd_mobilenet_v1.hef deeplab_v3_mobilenet_v2_wo_dilation.hef; do
+    [ -f "$RES/$h" ] || cp "$HOME/mz3_exp/resources/$h" "$RES/" 2>/dev/null
+done
+if [ ! -f "$HOME/mz3_exp/resources/$MNV2_HEF" ]; then
+    echo "[에러] 없음: $HOME/mz3_exp/resources/$MNV2_HEF"; exit 1
+fi
+cp "$HOME/mz3_exp/resources/$MNV2_HEF" "$RES/mobilenet_v2_1.0.hef"
+echo "mnv2 HEF: $MNV2_HEF  (결과 접미사='$MNV2_SUF')"
 IMG_DIR="$HOME/datasets/sampled_val2017"
-TRACES_DIR="$HOME/mz3_exp/traces_retrained"
+TRACES_DIR="$HOME/mz3_exp/traces_retrained${MNV2_SUF}"
 FRAMES=673
 REPEAT=3
 
@@ -78,7 +101,7 @@ if [ -n "$MON_PY" ]; then
     fi
 fi
 NPU_LOG="$HOME/hailo_cpp_test/npu_log.txt"     # hailo_utilization.py 가 쓰는 고정 경로
-NPU_CSV="$HOME/mz3_exp/csv/npu_percent_retrained.csv"
+NPU_CSV="$HOME/mz3_exp/csv/npu_percent_retrained${MNV2_SUF}.csv"
 
 if [ -z "$MON_PY" ] || [ ! -f "$MON_DIR/scheduler_mon_pb2.py" ]; then
     echo "[경고] hailo_utilization.py 또는 scheduler_mon_pb2.py 를 못 찾았습니다."
@@ -91,10 +114,18 @@ else
     [ -f "$NPU_CSV" ] || echo "tag,run_id,input_fps,npu_percent,n_samples" > "$NPU_CSV"
 fi
 
-# HRTT 트레이싱. 가장 짧은 조건(수초)보다 작아야 덤프가 트리거되므로 3으로 둔다
-# (2026-08-08 기록: 30 이면 짧은 조건에서 .hrtt 가 아예 안 생김)
+# ── HRTT 트레이싱 ─────────────────────────────────────────────────────
+# [2026-09-01 실측 정정] HAILO_TRACE_TIME_IN_SECONDS_BOUNDED_DUMP=N 은
+# "N초 후 덤프"가 아니라 **최근 N초만 담는 링버퍼**다.
+#   · N=30 (npu-rpi1, 42런): 모든 런이 30초 미만이라 런 전체가 담김.
+#     트레이스 42개 = 런 42개, D2H 프레임 673/1346 전량 기록됨.  ← 정상
+#   · N=3  (재학습 18런): 전 파일이 2.94초로 잘리고 파일 수 31개(런당 여러 개),
+#     프레임도 335~499개만 남음.                                  ← 데이터 손실
+# 따라서 **런 최대 길이보다 넉넉히 큰 값**을 써야 한다. 여기 최장 런이 22.4초이므로 30.
+# (2026-08-08 rpi4 에서 "30이면 짧은 조건 트레이스가 안 생긴다"고 기록했으나
+#  npu-rpi1 에서는 재현되지 않음 — 보드/드라이버 차이로 보임.)
 export HAILO_TRACE=scheduler
-export HAILO_TRACE_TIME_IN_SECONDS_BOUNDED_DUMP=3
+export HAILO_TRACE_TIME_IN_SECONDS_BOUNDED_DUMP=30
 export HAILO_TRACE_PATH="$TRACES_DIR"
 
 # SKIP_DEEPLAB=1 로 실행하면 deeplab 이 들어간 조건 4개를 건너뛴다.
@@ -172,7 +203,7 @@ run_set () {
 }
 
 echo "===== 재학습판 스윕 시작: $(date) ====="
-SUF=""; [ "${SKIP_DEEPLAB:-0}" = "1" ] && SUF="_nodeeplab"
+SUF="$MNV2_SUF"; [ "${SKIP_DEEPLAB:-0}" = "1" ] && SUF="${MNV2_SUF}_nodeeplab"
 run_set 0  "$HOME/mz3_exp/csv/results_mz3_retrained${SUF}.csv"       "rt${SUF}"
 run_set 30 "$HOME/mz3_exp/csv/results_mz3_retrained${SUF}_fps30.csv" "rt${SUF}_fps30"
 echo "===== 전체 완료: $(date) ====="
