@@ -42,3 +42,8 @@ results_prithr_raw.csv
 # 오피스 임시/락 파일
 .~lock.*
 *.tmp
+
+# 모델 컴파일 중간 산출물 (용량 큼: .har 8~55MB, .onnx 8MB대). 재생성 가능하므로 git 제외.
+# GitHub은 50MB 초과 파일에 경고, 100MB 초과는 거부한다.
+*.har
+*.onnx
