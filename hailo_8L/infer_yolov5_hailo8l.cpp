@@ -1,7 +1,8 @@
 /**
  * infer_yolov5_hailo8l.cpp
  * ------------------------------------------------------------------------
- * [2026-08-19 신규] YOLOv5 "NPU(neural core)측 후처리" 단독 벤치마크 (Hailo-8L, rpi1).
+ * [2026-08-19 신규, 2026-09-08 경로 수정] YOLOv5 "NPU(neural core)측 후처리" 단독 벤치마크
+ * (Hailo-8L, npu-rpi1 — 구 계정명 rpi1은 2026-08-20 npu-rpi1로 이관됨, CLAUDE.md 참고).
  * hailo_8/infer_yolov5_hailo8.cpp(Hailo-8/rpi4용, 2026-08-06 작성)를 Hailo-8L로 그대로
  * 포팅한 파일 — 사용자가 "앞으로는 Hailo-8L에서 실험한다(Hailo-8은 안 함)"고 정정해서
  * 만들어짐. 로직은 100% 동일하고, HEF 경로/데이터셋 경로/include 헤더만 8L 관례로 교체.
@@ -73,13 +74,9 @@
  *
  * "Det 단일모델, v8s_h8l(CPU 후처리) vs v5-nms_core(NPU 후처리), FPS=60, 3회 반복 후 평균"
  * 실험은 이 파일을 그대로 사용하고 scripts/run_det_v8s_vs_v5npu_fps60.sh가
- * MODEL_MODE(0=v5/NPU, 1=v8s/CPU)를 sed로 자동 토글해 양쪽을 순서대로
+ * USE_CPU_BASELINE_INSTEAD(0=v5/NPU, 1=v8s/CPU)를 sed로 자동 토글해 양쪽을 순서대로
  * 빌드/실행한다. 평균/xlsx는 scripts/make_avg_csv_det_v8s_vs_v5npu.py,
  * scripts/build_xlsx_det_v8s_vs_v5npu.py 참고.
- *
- * [2026-08-20 추가] "v5xs_wo_spp(CPU 후처리) 단독, INPUT_FPS{0,30} x 3회" 실험은
- * MODEL_MODE=2로 고정해서 돌린다 — scripts/run_det_v5cpu_fpssweep.sh 참고
- * (yolov5xs_wo_spp.hef를 별도로 받아야 함, wget 자동화 포함).
  * ------------------------------------------------------------------------
  */
 
@@ -128,27 +125,18 @@ using namespace hailort;
 // =====================================================================================
 
 // HEF 경로 — 기존 세 모델(hailo-rpi5-examples/resources)과 같은 디렉터리 관례.
+// [2026-09-08] 계정 이관(rpi1 -> npu-rpi1, 2026-08-20, CLAUDE.md) 반영 — /home/npu-rpi1/ 로 수정.
 // yolov5xs_wo_spp_nms_core.hef가 아직 없으면 먼저 받아야 함(스크립트가 자동으로 받음):
 //   wget -P /home/npu-rpi1/hailo-rpi5-examples/resources/ \
 //     https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.18.0/hailo8l/yolov5xs_wo_spp_nms_core.hef
 //   hailortcli parse-hef /home/npu-rpi1/hailo-rpi5-examples/resources/yolov5xs_wo_spp_nms_core.hef   # Architecture: HAILO8L 확인
 #define YOLOV5_HEF "/home/npu-rpi1/hailo-rpi5-examples/resources/yolov5xs_wo_spp_nms_core.hef"
 
-// 모델 모드 선택 (자동화 스크립트가 sed로 토글):
-//   0 = YOLOv5 NPU 후처리 (yolov5xs_wo_spp_nms_core.hef, engine=nn_core/auto)
-//   1 = YOLOv8s CPU 후처리 기준선 (yolov8s_h8l.hef, engine=cpu) — 기존 3모델 파일과 동일 HEF
-//   2 = [2026-08-20 신규] YOLOv5 CPU 후처리 (yolov5xs_wo_spp.hef, engine=cpu) — mode 0과
-//       동일 아키텍처(v5xs)에 "_nms_core" 접미사만 없는 버전. hailo_model_zoo에서
-//       nms_postprocess(..., engine=cpu)로 컴파일됨 → mode 1(v8s)과 동일하게 host가 NMS까지
-//       전부 수행하고 표준 NMS-by-class 포맷으로 출력하므로, decode_det()도 mode 1과 동일
-//       코드 경로를 그대로 탄다(모델 아키텍처와 무관하게 출력 포맷만 보고 파싱하는 함수라서
-//       변경 불필요 — postprocess_8l.hpp 상단 주석 참고). img_size는 mode 0과 동일한 512
-//       (v5xs 계열 공통 입력 크기, wo_spp/wo_spp_nms_core 둘 다 512x512).
-#define MODEL_MODE 0
+// 비교 기준(선택): 기존 engine=cpu 경로인 yolov8s_h8l.hef와 같은 실행 조건(단독, 동일
+// 파라미터)으로 돌리고 싶을 때 이 매크로를 1로 바꾸면 YOLOV5_HEF 대신
+// DET_HEF_CPU_BASELINE을 로드한다. (README.md/infer_scheduler.cpp의 DET_HEF와 동일 경로.)
+#define USE_CPU_BASELINE_INSTEAD 0
 #define DET_HEF_CPU_BASELINE "/home/npu-rpi1/hailo-rpi5-examples/resources/yolov8s_h8l.hef"
-// yolov5xs_wo_spp.hef (CPU 후처리판, nms_core 없음) — hailo8l 타겟, 공식 S3:
-//   https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.18.0/hailo8l/yolov5xs_wo_spp.hef
-#define V5_CPU_HEF "/home/npu-rpi1/hailo-rpi5-examples/resources/yolov5xs_wo_spp.hef"
 
 #define IMG_DIR  "/home/npu-rpi1/datasets/sampled_val2017/"
 
@@ -162,22 +150,16 @@ std::mutex print_mutex;
 #include "model_runner.hpp"
 
 // 이 파일 전용 1행 CSV (Det/Seg/Pose 3슬롯을 가정하는 csv_writer.hpp와 스키마가 달라 별도 작성).
-// [2026-08-19 확장] FPS 스윕(run_det_v8s_vs_v5npu_fpssweep.sh, INPUT_FPS={0,30})을 한 CSV에
-// 같이 담기 위해 input_fps 컬럼 추가. 또한 기존 3모델 csv_writer.hpp가 갖고 있던 HRTT 유래
-// 지표(npu_percent 등)를 이 실험에도 붙이기 위해 NaN 플레이스홀더 컬럼을 추가한다 —
-// npu_percent는 실행 스크립트가 hailo_utilization.py 로그를 읽어 마지막 행에 바로 채우고,
-// 나머지(switches_per_s/idle_time_pct/avg_fps_hrtt/avg_latency_hrtt/max_latency_hrtt/
-// activation_hrtt)는 다운로드 후 fill_hrtt_columns_det_v8s_vs_v5npu.py가 .hrtt를 직접
-// 파싱해서 채운다(csv_writer.hpp 3모델 스키마와 동일한 2단계 채움 방식).
+// hailo_8/infer_yolov5_hailo8.cpp::save_csv_single()과 완전히 동일한 스키마 — 두 보드
+// 결과를 나중에 나란히 비교하고 싶을 때도 컬럼이 그대로 맞는다.
 static void save_csv_single(const std::string& csv_path, int run_id, const ModelConfig& m,
                              const ModelResult& r, double cpu_percent, double mem_percent,
                              long vol_ctx, long nonvol_ctx, double run_time_s)
 {
     static const char* HEADER =
-        "run_id,hef_name,img_size,batch,threshold,timeout_ms,priority,input_fps,"
+        "run_id,hef_name,img_size,batch,threshold,timeout_ms,priority,"
         "frame_count,avg_preprocess_ms,avg_latency_ms,avg_postprocess_ms,avg_total_time_ms,"
-        "total_time_s,run_time_s,cpu_percent,mem_percent,voluntary_ctx_switches,nonvoluntary_ctx_switches,"
-        "npu_percent,switches_per_s,idle_time_pct,avg_fps_hrtt,avg_latency_hrtt,max_latency_hrtt,activation_hrtt";
+        "total_time_s,run_time_s,cpu_percent,mem_percent,voluntary_ctx_switches,nonvoluntary_ctx_switches";
 
     bool need_header = true;
     { std::ifstream chk(csv_path); if (chk.good() && chk.peek() != std::ifstream::traits_type::eof()) need_header = false; }
@@ -188,11 +170,10 @@ static void save_csv_single(const std::string& csv_path, int run_id, const Model
     auto dtos = [](double v) { if (v < 0) return std::string("NaN"); std::ostringstream os; os << v; return os.str(); };
 
     f << run_id << ',' << m.name << ',' << m.img_size << ',' << m.batch << ',' << m.threshold << ','
-      << m.timeout_ms << ',' << m.priority << ',' << INPUT_FPS << ',' << r.frame_count << ','
+      << m.timeout_ms << ',' << m.priority << ',' << r.frame_count << ','
       << dtos(r.avg_preprocess_ms) << ',' << dtos(r.avg_latency_ms) << ',' << dtos(r.avg_postprocess_ms) << ','
       << dtos(r.avg_total_time_ms) << ',' << dtos(r.total_time_s) << ',' << dtos(run_time_s) << ','
-      << dtos(cpu_percent) << ',' << dtos(mem_percent) << ',' << vol_ctx << ',' << nonvol_ctx << ','
-      << "NaN,NaN,NaN,NaN,NaN,NaN,NaN" << "\n";   // npu_percent~activation_hrtt: 실행/후처리 스크립트가 채움
+      << dtos(cpu_percent) << ',' << dtos(mem_percent) << ',' << vol_ctx << ',' << nonvol_ctx << "\n";
     f.close();
     std::printf("[CSV] 저장: %s (run_id=%d)\n", csv_path.c_str(), run_id);
 }
@@ -204,10 +185,7 @@ int main(int argc, char* argv[])
 
     pid_t my_pid = getpid();
     std::printf("PID: %d, Run ID: %d\n", my_pid, run_id);
-    const char* mode_desc = (MODEL_MODE == 1) ? "yolov8s_h8l (engine=cpu 기준선)"
-                            : (MODEL_MODE == 2) ? "yolov5xs_wo_spp (engine=cpu)"
-                            : "yolov5xs_wo_spp_nms_core (engine=nn_core/auto)";
-    std::printf("모델: %s\n", mode_desc);
+    std::printf("모델: %s\n", USE_CPU_BASELINE_INSTEAD ? "yolov8s_h8l (engine=cpu 기준선)" : "yolov5xs_wo_spp_nms_core (engine=nn_core/auto)");
 
     hailo_vdevice_params_t vdevice_params;
     hailo_init_vdevice_params(&vdevice_params);
@@ -220,13 +198,9 @@ int main(int argc, char* argv[])
     auto vdevice = vdevice_exp.release();
     std::cout << "VDevice 생성 성공!" << std::endl;
 
-    const char* hef_path = (MODEL_MODE == 1) ? DET_HEF_CPU_BASELINE
-                          : (MODEL_MODE == 2) ? V5_CPU_HEF
-                          : YOLOV5_HEF;
-    int img_size = (MODEL_MODE == 1) ? 640 : YOLOV5_IMG_SIZE;
-    const char* model_name = (MODEL_MODE == 1) ? "Detection-CPU-baseline"
-                            : (MODEL_MODE == 2) ? "YOLOv5-CPU-baseline"
-                            : "YOLOv5-NPU-postprocess";
+    const char* hef_path = USE_CPU_BASELINE_INSTEAD ? DET_HEF_CPU_BASELINE : YOLOV5_HEF;
+    int img_size = USE_CPU_BASELINE_INSTEAD ? 640 : YOLOV5_IMG_SIZE;
+    const char* model_name = USE_CPU_BASELINE_INSTEAD ? "Detection-CPU-baseline" : "YOLOv5-NPU-postprocess";
 
     std::vector<ModelConfig> models = {
         {hef_path, model_name, PRIORITY_YOLOV5, THRESHOLD_YOLOV5, TIMEOUT_YOLOV5_MS, BATCH_YOLOV5, true, ModelKind::DET, img_size},

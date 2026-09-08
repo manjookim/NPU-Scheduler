@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-build_xlsx_det_v8s_vs_v5npu.py — (Hailo-8L, rpi1) Det 단일모델 v8s_h8l(CPU 후처리) vs
+build_xlsx_det_v8s_vs_v5npu.py — (Hailo-8L, npu-rpi1) Det 단일모델 v8s_h8l(CPU 후처리) vs
 v5-nms_core(NPU 후처리) FPS=60 실험 결과를 컬럼설명/전체/조건별_3회평균 3개 시트짜리
 xlsx로 정리한다. (results_singlemodel_fps5to25.xlsx와 동일한 시트 구성 관례)
 
@@ -15,7 +15,7 @@ from openpyxl import Workbook
 
 COLUMN_DESC = [
     ("실험 조건",
-     "Hailo-8L(rpi1). Det(Detection) 단일모델만 대상. HEF 2종 비교: yolov8s_h8l.hef(engine=cpu, "
+     "Hailo-8L(npu-rpi1). Det(Detection) 단일모델만 대상. HEF 2종 비교: yolov8s_h8l.hef(engine=cpu, "
      "후처리를 host CPU에서 수행) vs yolov5xs_wo_spp_nms_core.hef(hailo8l 타겟, engine=nn_core/"
      "auto, 후처리 상당 부분을 NPU neural core에서 수행). batch=1/threshold=1/timeout=0ms/"
      "priority=0/INPUT_FPS=60으로 두 조건 동일 고정. 모델 버전(v8s/v5)과 입력 크기(640/512)는 "

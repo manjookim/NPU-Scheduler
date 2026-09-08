@@ -1,6 +1,7 @@
 #!/bin/bash
 # =============================================================================
-# [2026-08-19] Det 단일모델 NPU vs CPU 후처리 비교 (Hailo-8L, rpi1)
+# [2026-08-19, 2026-09-08 경로 수정] Det 단일모델 NPU vs CPU 후처리 비교 (Hailo-8L, npu-rpi1
+# — 구 계정명 rpi1은 2026-08-20 npu-rpi1로 이관됨, CLAUDE.md 참고)
 #
 # 목적: Detection 후처리를 NPU(neural core)에서 하는 것과 CPU(host)에서 하는 것 중
 # 어느 쪽이 더 빠른지 비교. HEF 2종:
@@ -12,7 +13,7 @@
 #  이 두 HEF를 쓰는 이상 피할 수 없는 제약 — 사용자도 이를 인지하고 그 외 나머지
 #  (batch/threshold/timeout/priority/INPUT_FPS/데이터셋)는 전부 통일하기로 함.)
 #
-# [원래 Hailo-8(rpi4)용으로 준비했던 실험을 사용자 요청으로 Hailo-8L(rpi1)로 이관함 —
+# [원래 Hailo-8(rpi4)용으로 준비했던 실험을 사용자 요청으로 Hailo-8L(npu-rpi1)로 이관함 —
 # 앞으로는 8L에서만 실험, Hailo-8은 사용 안 함.]
 #
 # 실행 프로그램: infer_yolov5_hailo8l.cpp (신규 — hailo_8/infer_yolov5_hailo8.cpp를 8L로
@@ -28,12 +29,12 @@
 #   avg_preprocess_ms (전처리) / avg_latency_ms (추론) / avg_postprocess_ms (후처리) /
 #   avg_total_time_ms (장당 전체=위 세 값의 합) / total_time_s (데이터셋 전체 처리 총 시간)
 #
-# [참고] Hailo-8L(rpi1, Ubuntu 24.04, 커널 6.8.x)은 Hailo-8(rpi4)에서 겪었던 hailo_pci
+# [참고] Hailo-8L(npu-rpi1, Ubuntu 24.04, 커널 6.8.x)은 Hailo-8(rpi4)에서 겪었던 hailo_pci
 # find_vma 커널 크래시 이슈가 보고된 적 없는 보드다(QUESTION_FOR_TA.md — 그 버그는 rpi4의
 # 커널 6.12.x 계열에서만 재현됨). 그래도 안전하게, 각 실행 후 CSV 행이 실제로 늘었는지
 # 확인해서 안 늘면 자동 재시도하는 최소한의 안전장치는 넣어둠(최대 MAX_ATTEMPTS회).
 #
-# 실행 위치: 보드(rpi1, ~/hailo_cpp_test/), infer_yolov5_hailo8l.cpp와 같은 디렉토리
+# 실행 위치: 보드(npu-rpi1, ~/hailo_cpp_test/), infer_yolov5_hailo8l.cpp와 같은 디렉토리
 # (hailo_8L/scripts/*.sh의 기존 관례를 따라 cwd와 무관하게 스크립트가 직접 cd한다).
 # 사용법: chmod +x run_det_v8s_vs_v5npu_fps60.sh
 #         nohup bash run_det_v8s_vs_v5npu_fps60.sh > det_v8s_vs_v5npu_fps60_log.txt 2>&1 &
@@ -60,7 +61,7 @@ REPEAT=3
 FPS=60
 MAX_ATTEMPTS=3
 
-HEF_DIR="/home/rpi1/hailo-rpi5-examples/resources"
+HEF_DIR="/home/npu-rpi1/hailo-rpi5-examples/resources"
 V5_HEF_NAME=yolov5xs_wo_spp_nms_core.hef
 V5_HEF_URL="https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.18.0/hailo8l/${V5_HEF_NAME}"
 V8S_HEF="${HEF_DIR}/yolov8s_h8l.hef"
@@ -165,6 +166,6 @@ else
 fi
 
 echo ""
-echo "[다음 단계] PC로 결과 다운로드 (README.md의 rpi1 접속 정보 사용):"
-echo "  scp -P 40021 rpi1@155.230.16.157:~/hailo_cpp_test/${EXP_DIR}/csv/*.csv ."
+echo "[다음 단계] PC로 결과 다운로드 (CLAUDE.md의 npu-rpi1 접속 정보 사용, 구 계정명 rpi1 아님):"
+echo "  scp -P 40021 npu-rpi1@155.230.16.157:~/hailo_cpp_test/${EXP_DIR}/csv/*.csv ."
 echo "  이후 PC에서: python3 hailo_8L/scripts/build_xlsx_det_v8s_vs_v5npu.py results_det_v8s_vs_v5npu_fps60.csv results_det_v8s_vs_v5npu_fps60_avg.csv"

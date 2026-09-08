@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-make_avg_csv_det_v8s_vs_v5npu.py — (Hailo-8L, rpi1) Det 단일모델 v8s_h8l(CPU 후처리) vs
+make_avg_csv_det_v8s_vs_v5npu.py — (Hailo-8L, npu-rpi1) Det 단일모델 v8s_h8l(CPU 후처리) vs
 v5-nms_core(NPU 후처리) FPS=60 실험의 3회 반복을 조건(hef_name)별로 평균.
 
 infer_yolov5_hailo8l.cpp::save_csv_single()이 만든 CSV 전용 스키마(hailo_8/infer_yolov5_hailo8.cpp
