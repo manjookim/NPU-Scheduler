@@ -217,7 +217,7 @@ def main():
         model.cpu().eval()
         dummy = torch.randn(1, 3, IMG, IMG)
         out_name = {"logits": "logits", "resize_argmax": "ArgMax", "argmax_first": "ArgMax"}[a.mode]
-        torch.onnx.export(model, dummy, a.onnx,
+        torch.onnx.export(model, dummy, a.onnx, dynamo=False,
                           input_names=["input"], output_names=[out_name],
                           opset_version=a.opset, do_constant_folding=True, dynamic_axes=None)
         print(f"\nONNX 저장: {a.onnx}")
