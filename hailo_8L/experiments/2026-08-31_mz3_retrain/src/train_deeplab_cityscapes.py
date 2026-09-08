@@ -176,33 +176,97 @@ class ASPP(nn.Module):
         return self.proj(torch.cat([self.b0(x)] + [b(x) for b in self.bs], dim=1))
 
 
+class OfficialHead(nn.Module):
+    """[2026-09-09 신규] 공식 deeplab_v3_mobilenet_v2_wo_dilation 의 헤드를 그대로 복원.
+
+    추측이 아니라 **공식 HEF 를 파싱한 HN 에서 실측한 값**이다
+    (artifacts/pathA/control/deeplab_v3_mobilenet_v2_wo_dilation.har):
+
+        conv34   1x1 conv 960->320, linear      <- 백본 마지막 (features[17] 의 projection)
+        ├─ conv35   1x1 conv 320->256, relu                  (1x1 브랜치)
+        └─ avgpool1 17x17 global avg -> 1x1x320
+           fc1      320->256 dense, relu                     (image pooling 브랜치)
+           resize1  1x1 -> 17x17, nearest_neighbor
+        concat1  [resize1, conv35] -> 17x17x512              <- 순서 주의: pooling 이 앞
+        conv36   1x1 conv 512->256, relu                     (concat projection)
+        conv37   1x1 conv 256->21,  linear                   (logits)
+
+    HN 의 batch_norm=False 는 BN 이 없다는 뜻이 아니라 DFC 가 conv 에 **접어 넣은**
+    결과다. 학습 시에는 BN 이 있어야 하고, export 시 자동으로 접힌다.
+
+    3x3 atrous 브랜치는 없다 — wo_dilation 이라 atrous_rates 가 비어 있기 때문이다.
+    """
+
+    def __init__(self, cin=320, cout=256):
+        super().__init__()
+        # conv35 — 1x1 브랜치
+        self.branch = nn.Sequential(
+            nn.Conv2d(cin, cout, 1, bias=False), nn.BatchNorm2d(cout), nn.ReLU(inplace=True))
+        # avgpool1 + fc1 — image pooling 브랜치
+        self.pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(cin, cout, 1, bias=False), nn.BatchNorm2d(cout), nn.ReLU(inplace=True))
+        # conv36 — concat projection
+        self.project = nn.Sequential(
+            nn.Conv2d(2 * cout, cout, 1, bias=False), nn.BatchNorm2d(cout), nn.ReLU(inplace=True))
+
+    def forward(self, x):
+        h, w = x.shape[-2:]
+        b = self.branch(x)
+        p = self.pool(x)
+        # 공식 HN: method=nearest_neighbor (1x1 -> 17x17). bilinear 로 하면 DFC 가
+        # 다른 레이어로 파싱해서 구조가 어긋난다.
+        p = F.interpolate(p, size=(h, w), mode="nearest")
+        # 공식 concat1 의 입력 순서가 [resize1, conv35] 이므로 pooling 을 앞에 둔다.
+        return self.project(torch.cat([p, b], dim=1))
+
+
 class DeepLabV3MNv2(nn.Module):
     """MobileNetV2(OS=32, dilation 없음) + 헤드 + bilinear 업샘플 (+ export 시 argmax).
 
     [헤드 선택 — head 인자]
-      "simple" (기본, **공식 구성**):
-          백본(1280ch) -> Conv2d(1280, num_classes, 1) 하나.
-          TF research/deeplab 의 --model_variant="mobilenet_v2" 는 atrous_rates 를 주지
-          않으면 ASPP 를 만들지 않고 1x1 logits conv 만 붙인다. 그 구성이 Hailo Model Zoo
-          deeplab_v3_mobilenet_v2_wo_dilation 의 **2.10M 파라미터 / 3.21 GOPs** 와 맞는다.
-          -> 약 2.25M. 공식과 거의 동일해서 latency/컨텍스트 비교가 성립한다.
+      "official" (기본, 2026-09-09 신규):
+          백본을 **features[:18] (320ch) 에서 자르고** OfficialHead 를 붙인다.
+          공식 HEF 의 HN 을 실측해서 1:1 로 복원한 구성 -> 약 2.11M 파라미터로
+          공식 2.10M 과 사실상 동일(차이는 클래스 수 19 vs 21 뿐).
+          latency/컨텍스트 비교가 성립하는 유일한 구성이다.
+
+      "simple" (구버전 기본 — **공식 구성이 아니다**):
+          백본 전체(1280ch) -> Conv2d(1280, num_classes, 1) 하나. 약 2.25M.
+          [2026-09-09 정정] 이전 주석은 이 구성을 "공식 구성"이라고 적었으나 사실과
+          다르다. 공식 HN 을 직접 뜯어보니 공식은 (a) 백본을 320ch 에서 자르고
+          (b) image pooling 브랜치 + concat projection 을 갖는다. simple 은 둘 다 없고
+          대신 320->1280 conv(17x17 에서 약 118M MAC)를 그대로 안고 간다.
+          꼬리 연산량이 공식보다 무거워 동등 비교가 성립하지 않는다.
+          기존 체크포인트 호환용으로만 남겨 둔다.
 
       "aspp":
-          ASPP(3x3 브랜치 3개, 1280->256)를 붙인 무거운 변형. 약 11.7M 파라미터로
-          **공식 대비 5.6배**라 스케줄링 비교에는 쓰면 안 된다. 참고용으로만 남겨둔다.
+          3x3 atrous 브랜치 3개를 단 무거운 변형. 약 11.7M 로 공식 대비 5.6배.
+          스케줄링 비교에 쓰면 안 된다. 참고용.
 
-    export=True 로 두면 bilinear 업샘플 + argmax 까지 그래프에 포함한다(Hailo 규약)."""
+    export=True 로 두면 bilinear 업샘플 + argmax 까지 그래프에 포함한다(Hailo 규약).
 
-    def __init__(self, num_classes=NUM_CLASSES, pretrained=True, export=False, head="simple"):
+    [주의] head 를 바꾸면 가중치 shape 이 달라져 기존 체크포인트를 못 읽는다.
+           official 로 가려면 처음부터 재학습해야 한다.
+    """
+
+    def __init__(self, num_classes=NUM_CLASSES, pretrained=True, export=False, head="official"):
         super().__init__()
         from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
         w = MobileNet_V2_Weights.IMAGENET1K_V1 if pretrained else None
-        self.backbone = mobilenet_v2(weights=w).features   # 출력 1280ch, stride 32
+        feats = mobilenet_v2(weights=w).features
         self.head = head
-        if head == "aspp":
+        if head == "official":
+            # features[18] = ConvBNReLU(320->1280). 공식은 이걸 쓰지 않는다.
+            self.backbone = feats[:18]                     # 출력 320ch, stride 32
+            self.aspp = OfficialHead(320, 256)
+            self.classifier = nn.Conv2d(256, num_classes, 1)
+        elif head == "aspp":
+            self.backbone = feats
             self.aspp = ASPP(1280)
             self.classifier = nn.Conv2d(256, num_classes, 1)
-        else:
+        else:                                              # "simple" (구버전)
+            self.backbone = feats
             self.aspp = None
             self.classifier = nn.Conv2d(1280, num_classes, 1)
         self.export = export
@@ -212,7 +276,11 @@ class DeepLabV3MNv2(nn.Module):
         if self.aspp is not None:
             f = self.aspp(f)
         logits = self.classifier(f)
-        logits = F.interpolate(logits, size=(IMG, IMG), mode="bilinear", align_corners=False)
+        # [2026-09-09] align_corners=False -> True.
+        # False(=ONNX half_pixel)면 배율 513/17=30.176 이 한 단계로 남아 DFC 가 분해하지
+        # 못하고 microcode 초과로 컴파일이 실패한다. 공식 HN 은 align_corners 이고
+        # DFC 가 [15.0, 2.0118] 두 단계로 분해한다.
+        logits = F.interpolate(logits, size=(IMG, IMG), mode="bilinear", align_corners=True)
         if self.export:
             return torch.argmax(logits, dim=1, keepdim=True).to(torch.int32)  # N,1,513,513
         return logits
@@ -260,8 +328,9 @@ def main():
     ap.add_argument("--batch", type=int, default=4, help="RTX 5060 8GB 기준 4~6 권장")
     ap.add_argument("--lr", type=float, default=0.02)
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--head", choices=["simple", "aspp"], default="simple",
-                    help="simple=공식 구성(1x1 conv, ~2.25M) / aspp=무거운 변형(~11.7M)")
+    ap.add_argument("--head", choices=["official", "simple", "aspp"], default="official",
+                    help="official=공식 HN 복원(~2.11M, 공식 2.10M과 동등 — 이걸 쓸 것) / "
+                         "simple=구버전(~2.25M, 공식 구성 아님) / aspp=무거운 변형(~11.7M)")
     ap.add_argument("--resume", action="store_true", help="out/last.pt 에서 이어서")
     ap.add_argument("--eval-only", action="store_true")
     ap.add_argument("--export-onnx", metavar="PATH")
