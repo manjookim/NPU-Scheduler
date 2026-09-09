@@ -1,0 +1,30 @@
+# 생성: compile_deeplab.py --emit-yaml (2026-09-02)
+# network_path 는 hailomz --ckpt 로 덮어쓸 수 있습니다.
+base:
+- base/cityscapes.yaml
+network:
+  network_name: deeplab_v3_mnv2_wo_dilation_cityscapes
+paths:
+  network_path:
+  - /mnt/c/Users/sset0/jungmin-claude/StudentExperiment/NPUscheduler/hailo_8L/experiments/2026-08-31_mz3_retrain/artifacts/deeplab_cs_logits.onnx
+  alls_script: deeplab_v3_mnv2_wo_dilation_cityscapes.alls
+parser:
+  nodes:
+  - /backbone/backbone.0/backbone.0.0/Conv
+  - /classifier/Conv
+  normalization_params:
+    normalize_in_net: true
+    mean_list: [127.5, 127.5, 127.5]
+    std_list: [127.5, 127.5, 127.5]
+postprocessing:
+  device_pre_post_layers: {max_finder: false, bilinear: true, argmax: true, softmax: false}
+preprocessing:
+  network_type: segmentation
+  meta_arch: fcn_resnet
+evaluation:
+  labels_offset: 0
+  classes: 19
+info:
+  task: segmentation
+  input_shape: 513x513x3
+  training_data: cityscapes train
