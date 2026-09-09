@@ -47,3 +47,15 @@ results_prithr_raw.csv
 # GitHub은 50MB 초과 파일에 경고, 100MB 초과는 거부한다.
 *.har
 *.onnx
+
+# MZ3 실험(2026-09) 트레이스·리포트 — 위 hailo_8/experiments/traces 와 같은 이유로 제외.
+# 실험 폴더 안에서 traces/ = .hrtt 원본, hrtt/ = 구글드라이브용 평탄화 사본,
+# html/ = runtime-profiler 변환 리포트. 셋 다 용량이 커서(런 21개 기준 ~31MB)
+# git 으로는 csv/xlsx/manifests 요약본만 추적한다.
+hailo_8L/experiments/*/traces/
+hailo_8L/experiments/*/hrtt/
+hailo_8L/experiments/*/html/
+hrtt_mz3_*/
+
+# 편집 백업본 (이미 추적 중인 .bak 은 그대로 남는다 — gitignore 는 추적 파일엔 적용 안 됨)
+*.bak
